@@ -13,7 +13,8 @@ export function SettingsAndInfraView({ settings, onUpdated }: SettingsAndInfraVi
   const [maxRetries, setMaxRetries] = useState(settings.max_send_retries || '3');
   const [retentionDays, setRetentionDays] = useState(settings.retention_days || '30');
   const [sweeperResult, setSweeperResult] = useState<string | null>(null);
-  const [dockerSnippet, setDockerSnippet] = useState('');
+  const [ubuntuSetupSnippet, setUbuntuSetupSnippet] = useState('');
+  const [nginxSnippet, setNginxSnippet] = useState('');
   const [saved, setSaved] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -25,8 +26,11 @@ export function SettingsAndInfraView({ settings, onUpdated }: SettingsAndInfraVi
   }, [settings]);
 
   useEffect(() => {
-    apiRequest<{ docker_compose_snippet: string }>('/api/admin/blueprints')
-      .then((b) => setDockerSnippet(b.docker_compose_snippet))
+    apiRequest<{ ubuntu_setup_snippet?: string; ubuntu_nginx_snippet?: string }>('/api/admin/blueprints')
+      .then((b) => {
+        setUbuntuSetupSnippet(b.ubuntu_setup_snippet || '');
+        setNginxSnippet(b.ubuntu_nginx_snippet || '');
+      })
       .catch(() => {});
   }, []);
 
@@ -81,7 +85,7 @@ export function SettingsAndInfraView({ settings, onUpdated }: SettingsAndInfraVi
       <div>
         <h2 className="text-base font-semibold text-slate-900">Platform Settings, Kill Switch &amp; Deployment</h2>
         <p className="text-xs text-slate-500 mt-0.5">
-          Live operational controls, queue recovery parameters, compliance boundaries, and self-hosted Docker Compose deployment layout.
+          Live operational controls, queue recovery parameters, compliance boundaries, and Ubuntu VPS systemd + Nginx deployment setup.
         </p>
       </div>
 
@@ -206,11 +210,19 @@ export function SettingsAndInfraView({ settings, onUpdated }: SettingsAndInfraVi
             <li>Never auto-failover to third-party SMS providers without explicit owner approval.</li>
             <li>Android <code className="font-mono">SEND_SMS</code> requires explicit user grant and private/managed distribution outside Play restrictions.</li>
           </ul>
-          <div className="pt-2">
-            <div className="text-xs font-medium text-slate-700 mb-1.5">AWS EC2 Docker Compose Reference</div>
+          <div className="pt-2 space-y-2">
+            <div className="text-xs font-medium text-slate-700">Ubuntu VPS Deployment (Node 22 + systemd + Nginx)</div>
             <pre className="bg-slate-900 text-slate-200 rounded p-3 text-[11px] font-mono overflow-x-auto leading-relaxed">
-              {dockerSnippet}
+              {ubuntuSetupSnippet}
             </pre>
+            {nginxSnippet && (
+              <>
+                <div className="text-xs font-medium text-slate-700 pt-1">Nginx Reverse Proxy (deploy/nginx-simvault.conf)</div>
+                <pre className="bg-slate-900 text-slate-200 rounded p-3 text-[11px] font-mono overflow-x-auto leading-relaxed">
+                  {nginxSnippet}
+                </pre>
+              </>
+            )}
           </div>
         </div>
       </div>

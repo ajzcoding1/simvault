@@ -3,8 +3,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { createServer as createViteServer } from 'vite';
-import { getDb } from './server/db';
+import { closeDb, getDb } from './server/db';
 import { createV1Router } from './server/routes/v1';
 import { createAdminRouter } from './server/routes/admin';
 import { runSweeperTick } from './server/services';
@@ -12,7 +11,11 @@ import { runSweeperTick } from './server/services';
 async function startServer() {
   const app = express();
   app.set('trust proxy', 1);
+  app.disable('x-powered-by');
+
+  const host = process.env.HOST ?? '0.0.0.0';
   const port = Number(process.env.PORT ?? 3000);
+  const isProd = process.env.NODE_ENV === 'production';
   const db = getDb();
 
   // Security headers (Doc 07)
@@ -40,6 +43,8 @@ async function startServer() {
     res.json({
       status: 'ok',
       version: '1.0.0',
+      mode: isProd ? 'production' : 'development',
+      uptime_seconds: Math.floor(process.uptime()),
       timestamp: new Date().toISOString(),
       queue_depth: queueRow.count,
       gateway_devices_online: onlineDevices.count,
@@ -52,18 +57,28 @@ async function startServer() {
   // Owner Dashboard APIs
   app.use('/api/admin', createAdminRouter(db));
 
+  // Return structured JSON 404 for unknown API/gateway routes instead of HTML fallback
+  app.use('/v1', (_req: Request, res: Response) => {
+    res.status(404).json({ error: { code: 'NOT_FOUND', message: 'API endpoint not found.' } });
+  });
+  app.use('/api', (_req: Request, res: Response) => {
+    res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Admin API endpoint not found.' } });
+  });
+
   // Background queue sweeper (stale leases, device offline detection, OTP expiry, webhook retries)
-  setInterval(() => {
+  const sweeperTimer = setInterval(() => {
     try {
       runSweeperTick(db);
     } catch {
       // Keep background worker resilient
     }
   }, 2500);
+  sweeperTimer.unref();
 
   const httpServer = http.createServer(app);
 
-  if (process.env.NODE_ENV !== 'production') {
+  if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -75,16 +90,51 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(process.cwd(), 'dist');
-    if (fs.existsSync(distPath)) {
-      app.use(express.static(distPath));
-      app.get('*', (_req: Request, res: Response) => {
-        res.sendFile(path.join(distPath, 'index.html'));
-      });
+    if (!fs.existsSync(path.join(distPath, 'index.html'))) {
+      console.error('Production build missing in ./dist. Run "npm run build" before starting in production mode.');
+      process.exit(1);
     }
+
+    app.use(
+      express.static(distPath, {
+        index: false,
+        setHeaders: (res, filePath) => {
+          if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          } else {
+            res.setHeader('Cache-Control', 'no-cache');
+          }
+        },
+      })
+    );
+
+    app.get('*', (_req: Request, res: Response) => {
+      res.setHeader('Cache-Control', 'no-cache');
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
   }
 
-  httpServer.listen(port, '0.0.0.0', () => {
-    console.log(`SimVault server listening on http://0.0.0.0:${port}`);
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`Received ${signal}, shutting down SimVault gracefully...`);
+    clearInterval(sweeperTimer);
+    httpServer.close(() => {
+      closeDb();
+      process.exit(0);
+    });
+    setTimeout(() => {
+      closeDb();
+      process.exit(1);
+    }, 8000).unref();
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+
+  httpServer.listen(port, host, () => {
+    console.log(`SimVault server (${isProd ? 'production' : 'development'}) listening on http://${host}:${port}`);
   });
 }
 

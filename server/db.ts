@@ -25,6 +25,21 @@ export function getDb(dbPath?: string): DatabaseSync {
   return db;
 }
 
+export function closeDb(): void {
+  if (!dbInstance) return;
+  try {
+    dbInstance.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+  } catch {
+    // Ignore checkpoint errors on already-closed or in-memory DBs
+  }
+  try {
+    dbInstance.close();
+  } catch {
+    // Ignore close errors
+  }
+  dbInstance = null;
+}
+
 export function createIsolatedTestDb(): DatabaseSync {
   const db = new DatabaseSync(':memory:');
   db.exec('PRAGMA foreign_keys = ON;');
@@ -346,10 +361,12 @@ function seedInitialData(db: DatabaseSync): void {
   const isoNow = now.toISOString();
 
   const ownerId = 'usr_owner_primary';
+  const initialEmail = (process.env.SIMVAULT_ADMIN_EMAIL || 'owner@simvault.local').trim().toLowerCase();
+  const initialPassword = process.env.SIMVAULT_ADMIN_PASSWORD || 'SimVault!2026';
   db.prepare(
     `INSERT INTO users (id, email, password_hash, role, mfa_enabled, mfa_secret, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(ownerId, 'owner@simvault.local', hashPassword('SimVault!2026'), 'owner', 0, generateTotpSecret(), isoNow, isoNow);
+  ).run(ownerId, initialEmail, hashPassword(initialPassword), 'owner', 0, generateTotpSecret(), isoNow, isoNow);
 
   // Live-mode platform defaults
   const settings: Array<[string, string]> = [

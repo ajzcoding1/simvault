@@ -10,7 +10,9 @@ function loadOrCreateRuntimeKeys(): Record<KeyName, string> {
   if (runtimeKeysCache) return runtimeKeysCache;
 
   const isInMemory = process.env.NODE_ENV === 'test' || process.env.SIMVAULT_DB_PATH === ':memory:';
-  const keysPath = path.resolve(process.cwd(), 'data', '.simvault.keys');
+  const keysPath = process.env.SIMVAULT_KEYS_PATH
+    ? path.resolve(process.env.SIMVAULT_KEYS_PATH)
+    : path.resolve(process.cwd(), 'data', '.simvault.keys');
 
   if (!isInMemory && fs.existsSync(keysPath)) {
     try {

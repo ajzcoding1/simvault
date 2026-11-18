@@ -1273,27 +1273,28 @@ class SmsDispatchWorker(ctx: Context, params: WorkerParameters) : CoroutineWorke
     return Result.success()
   }
 }`,
-      docker_compose_snippet: `services:
-  nginx:
-    image: nginx:1.27-alpine
-    ports: ["80:80", "443:443"]
-    depends_on: [web, api]
-  api:
-    build: ./apps/api
-    env_file: .env
-    depends_on: [postgres, redis]
-  worker:
-    build: ./apps/worker
-    env_file: .env
-    depends_on: [postgres, redis]
-  web:
-    build: ./apps/web
-    env_file: .env
-  postgres:
-    image: postgres:16-alpine
-    volumes: ["pgdata:/var/lib/postgresql/data"]
-  redis:
-    image: redis:7-alpine`,
+      ubuntu_setup_snippet: `# 1. Auto Setup (Node 22 + systemd + Nginx + SSL):
+sudo bash deploy/ubuntu-setup.sh sms.yourdomain.com owner@yourdomain.com
+
+# 2. Manual Build & Production Start:
+npm ci && npm run build
+NODE_ENV=production npm run start:prod
+
+# 3. Manage systemd service:
+sudo systemctl status simvault
+sudo systemctl restart simvault
+sudo journalctl -u simvault -f`,
+      ubuntu_nginx_snippet: `server {
+  listen 80;
+  server_name sms.yourdomain.com;
+  location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}`,
     });
   });
 
