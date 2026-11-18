@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import express from 'express';
 import http from 'node:http';
 import crypto from 'node:crypto';
-import { createIsolatedTestDb } from '../server/db';
-import { decryptField, generateApiKey, hashApiKey, hashOtpCode } from '../server/crypto';
+import path from 'node:path';
+import { createIsolatedTestDb, resolveDbPath, syncEnvAdminCredentials } from '../server/db';
+import { decryptField, generateApiKey, hashApiKey, hashOtpCode, verifyPassword } from '../server/crypto';
 import { createAdminRouter } from '../server/routes/admin';
 import { createV1Router } from '../server/routes/v1';
 import {
@@ -301,3 +302,35 @@ test('Admin endpoints enforce strict 401 auth, CSRF protection, enrollment -> SI
     assert.ok(crypto.randomBytes(1).length === 1);
   });
 });
+
+test('resolveDbPath handles empty strings, sqlite:// URIs, and relative paths', () => {
+  assert.equal(resolveDbPath(':memory:'), ':memory:');
+  assert.equal(resolveDbPath(''), path.resolve(process.cwd(), 'data', 'simvault.db'));
+  assert.equal(resolveDbPath('   '), path.resolve(process.cwd(), 'data', 'simvault.db'));
+  assert.equal(resolveDbPath('sqlite://./data/custom.db'), path.resolve(process.cwd(), 'data/custom.db'));
+});
+
+test('syncEnvAdminCredentials updates existing owner email/password when .env values change without clobbering unchanged restarts', () => {
+  const db = createIsolatedTestDb();
+
+  // Updating via .env overrides updates the seeded owner user
+  const updated1 = syncEnvAdminCredentials(db, { email: 'admin@example.org', password: 'NewStrongPassword!99' });
+  assert.equal(updated1, true);
+  const row1 = db.prepare("SELECT email, password_hash FROM users WHERE id = 'usr_owner_primary'").get() as {
+    email: string;
+    password_hash: string;
+  };
+  assert.equal(row1.email, 'admin@example.org');
+  assert.equal(verifyPassword('NewStrongPassword!99', row1.password_hash), true);
+
+  // Calling again with identical .env values is a no-op so UI password changes are preserved
+  const updated2 = syncEnvAdminCredentials(db, { email: 'admin@example.org', password: 'NewStrongPassword!99' });
+  assert.equal(updated2, false);
+
+  // Changing password in .env again triggers another sync
+  const updated3 = syncEnvAdminCredentials(db, { email: 'admin@example.org', password: 'RotatedEnvPassword!22' });
+  assert.equal(updated3, true);
+  const row2 = db.prepare("SELECT password_hash FROM users WHERE id = 'usr_owner_primary'").get() as { password_hash: string };
+  assert.equal(verifyPassword('RotatedEnvPassword!22', row2.password_hash), true);
+});
+

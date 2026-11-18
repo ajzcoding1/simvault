@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import {
@@ -10,17 +11,52 @@ import { redactSensitiveMetadata } from '../src/shared/smsRules';
 
 let dbInstance: DatabaseSync | null = null;
 
+export function resolveDbPath(dbPath?: string): string {
+  const raw = (dbPath !== undefined ? dbPath : process.env.SIMVAULT_DB_PATH)?.trim() ?? '';
+  if (raw === ':memory:') return ':memory:';
+  if (!raw) return path.resolve(process.cwd(), 'data', 'simvault.db');
+
+  let cleaned = raw;
+  if (cleaned.startsWith('sqlite://')) cleaned = cleaned.slice('sqlite://'.length);
+  else if (cleaned.startsWith('file://')) cleaned = cleaned.slice('file://'.length);
+
+  if (cleaned === '~/') cleaned = os.homedir();
+  else if (cleaned.startsWith('~/')) cleaned = path.join(os.homedir(), cleaned.slice(2));
+
+  return path.resolve(process.cwd(), cleaned);
+}
+
 export function getDb(dbPath?: string): DatabaseSync {
   if (dbInstance) return dbInstance;
-  const targetPath = dbPath ?? process.env.SIMVAULT_DB_PATH ?? path.resolve(process.cwd(), 'data', 'simvault.db');
+  const targetPath = resolveDbPath(dbPath);
   if (targetPath !== ':memory:') {
-    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    const dir = path.dirname(targetPath);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.accessSync(dir, fs.constants.W_OK);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Cannot write to SimVault database directory "${dir}" (resolved from SIMVAULT_DB_PATH="${process.env.SIMVAULT_DB_PATH ?? ''}", cwd="${process.cwd()}"). Fix folder permissions or set SIMVAULT_DB_PATH="./data/simvault.db" in .env. Details: ${reason}`
+      );
+    }
   }
-  const db = new DatabaseSync(targetPath);
+
+  let db: DatabaseSync;
+  try {
+    db = new DatabaseSync(targetPath);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Unable to open SQLite database at "${targetPath}". Check file/folder permissions (if created with sudo, run "sudo chown -R $USER:$USER ${path.dirname(targetPath)}") or check SIMVAULT_DB_PATH in .env. Details: ${reason}`
+    );
+  }
+
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA foreign_keys = ON;');
   migrateSchema(db);
   seedInitialData(db);
+  syncEnvAdminCredentials(db);
   dbInstance = db;
   return db;
 }
@@ -444,6 +480,14 @@ function seedInitialData(db: DatabaseSync): void {
     insertTpl.run(t.id, ownerId, t.code, t.purpose, t.body, t.status, isoNow, isoNow);
   }
 
+  if (process.env.SIMVAULT_ADMIN_EMAIL?.trim() || process.env.SIMVAULT_ADMIN_PASSWORD?.trim()) {
+    const initialSig = crypto
+      .createHash('sha256')
+      .update(`${process.env.SIMVAULT_ADMIN_EMAIL?.trim().toLowerCase() ?? ''}:${process.env.SIMVAULT_ADMIN_PASSWORD?.trim() ?? ''}`)
+      .digest('hex');
+    insertSetting.run('env_admin_sync_sig', initialSig, isoNow);
+  }
+
   writeAuditLog(db, {
     actorType: 'system',
     actorId: 'bootstrap',
@@ -453,4 +497,62 @@ function seedInitialData(db: DatabaseSync): void {
     metadata: { live_mode: true },
     ipAddress: '127.0.0.1',
   });
+}
+
+export function syncEnvAdminCredentials(
+  db: DatabaseSync,
+  overrides?: { email?: string; password?: string }
+): boolean {
+  const rawEmail = (overrides?.email !== undefined ? overrides.email : process.env.SIMVAULT_ADMIN_EMAIL)?.trim().toLowerCase() ?? '';
+  const rawPassword = (overrides?.password !== undefined ? overrides.password : process.env.SIMVAULT_ADMIN_PASSWORD)?.trim() ?? '';
+  if (!rawEmail && !rawPassword) return false;
+
+  const sig = crypto.createHash('sha256').update(`${rawEmail}:${rawPassword}`).digest('hex');
+  const existingSig = db
+    .prepare("SELECT value FROM platform_settings WHERE key = 'env_admin_sync_sig'")
+    .get() as { value: string } | undefined;
+  if (existingSig?.value === sig) return false;
+
+  const owner = db
+    .prepare("SELECT id, email FROM users WHERE role = 'owner' ORDER BY created_at ASC LIMIT 1")
+    .get() as { id: string; email: string } | undefined;
+  if (!owner) return false;
+
+  const nowIso = new Date().toISOString();
+  const nextEmail = rawEmail || owner.email;
+
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    if (rawPassword) {
+      db.prepare('UPDATE users SET email = ?, password_hash = ?, updated_at = ? WHERE id = ?').run(
+        nextEmail,
+        hashPassword(rawPassword),
+        nowIso,
+        owner.id
+      );
+      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(owner.id);
+    } else {
+      db.prepare('UPDATE users SET email = ?, updated_at = ? WHERE id = ?').run(nextEmail, nowIso, owner.id);
+    }
+
+    db.prepare(
+      `INSERT INTO platform_settings (key, value, updated_at) VALUES ('env_admin_sync_sig', ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    ).run(sig, nowIso);
+    db.exec('COMMIT;');
+  } catch (err) {
+    db.exec('ROLLBACK;');
+    throw err;
+  }
+
+  writeAuditLog(db, {
+    actorType: 'system',
+    actorId: 'env_sync',
+    action: 'owner.env_credentials_synced',
+    targetType: 'user',
+    targetId: owner.id,
+    metadata: { email: nextEmail, password_updated: Boolean(rawPassword) },
+    ipAddress: '127.0.0.1',
+  });
+  return true;
 }

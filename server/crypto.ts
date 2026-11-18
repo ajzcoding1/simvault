@@ -1,18 +1,24 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 type KeyName = 'API_KEY_PEPPER' | 'JWT_PRIVATE_KEY' | 'OTP_PEPPER' | 'FIELD_ENCRYPTION_KEY';
 
 let runtimeKeysCache: Record<KeyName, string> | null = null;
 
+function resolveKeysPath(): string {
+  const raw = process.env.SIMVAULT_KEYS_PATH?.trim();
+  if (!raw) return path.resolve(process.cwd(), 'data', '.simvault.keys');
+  const expanded = raw.startsWith('~/') ? path.join(os.homedir(), raw.slice(2)) : raw;
+  return path.resolve(process.cwd(), expanded);
+}
+
 function loadOrCreateRuntimeKeys(): Record<KeyName, string> {
   if (runtimeKeysCache) return runtimeKeysCache;
 
   const isInMemory = process.env.NODE_ENV === 'test' || process.env.SIMVAULT_DB_PATH === ':memory:';
-  const keysPath = process.env.SIMVAULT_KEYS_PATH
-    ? path.resolve(process.env.SIMVAULT_KEYS_PATH)
-    : path.resolve(process.cwd(), 'data', '.simvault.keys');
+  const keysPath = resolveKeysPath();
 
   if (!isInMemory && fs.existsSync(keysPath)) {
     try {
