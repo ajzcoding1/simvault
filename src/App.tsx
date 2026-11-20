@@ -9,15 +9,26 @@ import {
   Lock,
   Menu,
   MessageSquare,
+  Monitor,
+  Moon,
   PauseOctagon,
   ScrollText,
   Settings,
   ShieldCheck,
   Smartphone,
+  Sun,
   Webhook,
   X,
 } from 'lucide-react';
 import { apiRequest, registerUnauthorizedHandler, setCsrfToken } from './lib/api';
+import {
+  THEME_STORAGE_KEY,
+  type ThemeMode,
+  getNextThemeMode,
+  getThemeLabel,
+  normalizeThemeMode,
+  resolveIsDark,
+} from './utils/theme';
 import type { ApplicationRecord, NavSection, OverviewResponse } from './types';
 import { OverviewView } from './components/OverviewView';
 import { MessagesView } from './components/MessagesView';
@@ -105,6 +116,38 @@ export default function App() {
   const [mfaPrompt, setMfaPrompt] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
+
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
+    try {
+      return normalizeThemeMode(localStorage.getItem(THEME_STORAGE_KEY));
+    } catch {
+      return 'system';
+    }
+  });
+
+  useEffect(() => {
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    const applyTheme = () => {
+      const isDark = resolveIsDark(themeMode, media.matches);
+      document.documentElement.classList.toggle('dark', isDark);
+      document.documentElement.style.colorScheme = isDark ? 'dark' : 'light';
+    };
+    applyTheme();
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, themeMode);
+    } catch {
+      // Ignore storage failures in private browsing
+    }
+    media.addEventListener('change', applyTheme);
+    return () => media.removeEventListener('change', applyTheme);
+  }, [themeMode]);
+
+  const cycleTheme = () => {
+    setThemeMode((prev) => getNextThemeMode(prev));
+  };
+
+  const ThemeIcon = themeMode === 'dark' ? Moon : themeMode === 'light' ? Sun : Monitor;
+  const themeLabel = getThemeLabel(themeMode);
 
   useEffect(() => {
     registerUnauthorizedHandler(() => {
@@ -234,19 +277,35 @@ export default function App() {
 
   if (!authChecked) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
-        <div className="text-xs font-medium text-slate-500">Verifying console session...</div>
+      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center p-4">
+        <div className="text-xs font-medium text-slate-500 dark:text-slate-400">Verifying console session...</div>
       </div>
     );
   }
 
   if (!authenticated) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
-        <form onSubmit={handleLogin} className="w-full max-w-sm bg-white border border-slate-200 rounded-lg p-6 space-y-4">
+      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex flex-col items-center justify-center p-4 relative">
+        <div className="absolute top-4 right-4">
+          <button
+            type="button"
+            onClick={cycleTheme}
+            aria-label={`Switch color theme (current: ${themeLabel})`}
+            title={`Theme: ${themeLabel} (click to cycle Auto / Dark / Light)`}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+          >
+            <ThemeIcon className="w-3.5 h-3.5" aria-hidden="true" />
+            <span>Theme: {themeLabel}</span>
+          </button>
+        </div>
+
+        <form
+          onSubmit={handleLogin}
+          className="w-full max-w-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-6 space-y-4 shadow-sm"
+        >
           <div>
-            <h1 className="text-lg font-bold text-slate-900">SimVault Owner Console</h1>
-            <p className="text-xs text-slate-500 mt-1">
+            <h1 className="text-lg font-bold text-slate-900 dark:text-slate-50">SimVault Owner Console</h1>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
               Live mode active. Sign in to manage Android gateways, SIM quotas, and API keys.
             </p>
           </div>
@@ -299,11 +358,11 @@ export default function App() {
           {loginError && <p className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded p-2">{loginError}</p>}
           <button
             type="submit"
-            className="w-full py-2 px-4 text-xs font-medium bg-slate-900 text-white rounded-md hover:bg-slate-800"
+            className="w-full py-2 px-4 text-xs font-medium bg-slate-900 dark:bg-blue-600 text-white rounded-md hover:bg-slate-800 dark:hover:bg-blue-500 transition-colors"
           >
             {mfaPrompt ? 'Verify MFA & Sign In' : 'Sign In'}
           </button>
-          <p className="text-[11px] text-slate-400">
+          <p className="text-[11px] text-slate-400 dark:text-slate-500">
             Update initial bootstrap credentials under Governance → Security &amp; Limits after sign-in.
           </p>
         </form>
@@ -343,8 +402,8 @@ export default function App() {
                       onClick={() => navigateTo(item.id)}
                       className={`w-full flex items-center gap-2.5 px-2.5 py-2 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
                         active
-                          ? 'bg-slate-900 text-white'
-                          : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+                          ? 'bg-slate-900 dark:bg-blue-600 text-white'
+                          : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-white'
                       }`}
                     >
                       <Icon className="w-4 h-4 shrink-0" aria-hidden="true" />
@@ -393,7 +452,9 @@ export default function App() {
                           type="button"
                           onClick={() => navigateTo(item.id)}
                           className={`w-full flex items-center gap-2.5 px-2.5 py-2 text-xs font-medium rounded-md ${
-                            active ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'
+                            active
+                              ? 'bg-slate-900 dark:bg-blue-600 text-white'
+                              : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
                           }`}
                         >
                           <Icon className="w-4 h-4 shrink-0" aria-hidden="true" />
@@ -431,7 +492,17 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+            <button
+              type="button"
+              onClick={cycleTheme}
+              aria-label={`Switch color theme (current: ${themeLabel})`}
+              title={`Theme: ${themeLabel} (click to cycle Auto / Dark / Light)`}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap shrink-0 transition-colors"
+            >
+              <ThemeIcon className="w-3.5 h-3.5" aria-hidden="true" />
+              <span className="hidden md:inline">{themeLabel}</span>
+            </button>
             {overview && (
               <button
                 type="button"
@@ -441,7 +512,7 @@ export default function App() {
                 className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border whitespace-nowrap shrink-0 transition-colors ${
                   overview.global_paused
                     ? 'bg-rose-700 border-rose-700 text-white hover:bg-rose-800'
-                    : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50'
+                    : 'bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800'
                 }`}
               >
                 <PauseOctagon className="w-3.5 h-3.5" aria-hidden="true" />
@@ -451,7 +522,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => setSendModalOpen(true)}
-              className="px-3.5 py-1.5 text-xs font-medium bg-blue-700 text-white rounded-md hover:bg-blue-800 whitespace-nowrap shrink-0"
+              className="px-3.5 py-1.5 text-xs font-medium bg-blue-700 dark:bg-blue-600 text-white rounded-md hover:bg-blue-800 dark:hover:bg-blue-500 whitespace-nowrap shrink-0 transition-colors"
             >
               Send SMS
             </button>
@@ -460,7 +531,7 @@ export default function App() {
 
         <main className="flex-1 p-4 sm:p-6 max-w-7xl w-full mx-auto">
           {actionFeedback && (
-            <div className="mb-4 bg-slate-900 text-white text-xs font-mono px-4 py-2.5 rounded-md">
+            <div className="mb-4 bg-slate-900 dark:bg-slate-800 border border-slate-800 dark:border-slate-700 text-white text-xs font-mono px-4 py-2.5 rounded-md">
               {actionFeedback}
             </div>
           )}

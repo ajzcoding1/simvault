@@ -2,8 +2,10 @@ package com.simvault.gateway.network
 
 import com.simvault.gateway.data.EnrollmentResult
 import com.simvault.gateway.data.GatewayApiException
+import com.simvault.gateway.data.HealthCheckResult
 import com.simvault.gateway.data.HeartbeatResult
 import com.simvault.gateway.data.LeasedJob
+import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -13,10 +15,8 @@ import java.util.concurrent.TimeUnit
 
 class SimVaultGatewayClient {
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .build()
+    private val client: OkHttpClient
+        get() = sharedHttpClient
 
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
 
@@ -36,6 +36,29 @@ class SimVaultGatewayClient {
             GatewayApiException(httpCode, code, msg)
         } catch (_: Exception) {
             GatewayApiException(httpCode, "HTTP_$httpCode", "$fallback ($httpCode)")
+        }
+    }
+
+    fun checkHealth(serverUrl: String): HealthCheckResult {
+        val baseUrl = requireHttps(serverUrl)
+        val req = Request.Builder()
+            .url("$baseUrl/health")
+            .get()
+            .build()
+
+        client.newCall(req).execute().use { res ->
+            val raw = res.body?.string().orEmpty()
+            if (!res.isSuccessful) {
+                throw parseApiError(res.code, raw, "Health check failed")
+            }
+            val json = JSONObject(raw)
+            return HealthCheckResult(
+                status = json.optString("status", "unknown"),
+                version = json.optString("version", "1.0.0"),
+                mode = json.optString("mode", "production"),
+                database = json.optString("database", "unknown"),
+                queueDepth = json.optInt("queue_depth", 0)
+            )
         }
     }
 
@@ -197,5 +220,15 @@ class SimVaultGatewayClient {
                 throw parseApiError(res.code, raw, "Delivery receipt upload failed")
             }
         }
+    }
+
+    companion object {
+        private val sharedHttpClient: OkHttpClient = OkHttpClient.Builder()
+            .connectTimeout(12, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .writeTimeout(15, TimeUnit.SECONDS)
+            .connectionPool(ConnectionPool(4, 90, TimeUnit.SECONDS))
+            .retryOnConnectionFailure(true)
+            .build()
     }
 }

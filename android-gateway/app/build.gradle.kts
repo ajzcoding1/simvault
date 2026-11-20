@@ -12,13 +12,13 @@ android {
         applicationId = "com.simvault.gateway"
         minSdk = 29
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.2.5"
+        versionCode = 3
+        versionName = "1.3.0"
 
         buildConfigField(
             "String",
             "DEFAULT_SERVER_URL",
-            "\"https://ais-dev-pthv5xe5qez4dsgwiic2le-124123308666.asia-southeast1.run.app\""
+            "\"https://simvault-two.vercel.app\""
         )
     }
 

@@ -46,20 +46,23 @@ class NativeSmsSender(private val context: Context) {
         if (!hasReadPhoneStatePermission()) return emptyList()
         val subManager = context.getSystemService(SubscriptionManager::class.java) ?: return emptyList()
         val activeList = subManager.activeSubscriptionInfoList ?: return emptyList()
-        return activeList.map { info ->
-            val rawNumber = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                subManager.getPhoneNumber(info.subscriptionId)
-            } else {
-                @Suppress("DEPRECATION")
-                info.number ?: ""
+        return activeList
+            .sortedBy { it.simSlotIndex }
+            .map { info ->
+                val rawNumber = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    subManager.getPhoneNumber(info.subscriptionId)
+                } else {
+                    @Suppress("DEPRECATION")
+                    info.number ?: ""
+                }
+                SimSubscriptionInfo(
+                    subscriptionId = info.subscriptionId,
+                    slotIndex = info.simSlotIndex,
+                    carrierLabel = info.carrierName?.toString()?.takeIf { it.isNotBlank() }
+                        ?: "SIM ${info.simSlotIndex + 1}",
+                    maskedMsisdn = if (rawNumber.isNotBlank()) LocalJobJournal.maskE164(rawNumber) else "Number hidden by SIM"
+                )
             }
-            SimSubscriptionInfo(
-                subscriptionId = info.subscriptionId,
-                slotIndex = info.simSlotIndex,
-                carrierLabel = info.carrierName?.toString() ?: "SIM ${info.simSlotIndex + 1}",
-                maskedMsisdn = if (rawNumber.isNotBlank()) LocalJobJournal.maskE164(rawNumber) else "Number hidden by SIM"
-            )
-        }
     }
 
     private fun resolveSmsManager(subscriptionId: Int): SmsManager? {
@@ -119,6 +122,10 @@ class NativeSmsSender(private val context: Context) {
                     SmsManager.RESULT_ERROR_NO_SERVICE -> SmsDispatchOutcome.Failed("NO_CARRIER_SERVICE")
                     SmsManager.RESULT_ERROR_GENERIC_FAILURE -> SmsDispatchOutcome.Failed("SMS_GENERIC_FAILURE")
                     SmsManager.RESULT_ERROR_NULL_PDU -> SmsDispatchOutcome.Failed("SMS_NULL_PDU")
+                    SmsManager.RESULT_ERROR_LIMIT_EXCEEDED -> SmsDispatchOutcome.Failed("SMS_LIMIT_EXCEEDED")
+                    SmsManager.RESULT_ERROR_FDN_CHECK_FAILURE -> SmsDispatchOutcome.Failed("FDN_CHECK_FAILURE")
+                    SmsManager.RESULT_ERROR_SHORT_CODE_NOT_ALLOWED -> SmsDispatchOutcome.Failed("SHORT_CODE_NOT_ALLOWED")
+                    SmsManager.RESULT_ERROR_SHORT_CODE_NEVER_ALLOWED -> SmsDispatchOutcome.Failed("SHORT_CODE_DENIED")
                     else -> SmsDispatchOutcome.DeliveryUnknown
                 }
                 if (partOutcome != null) {
