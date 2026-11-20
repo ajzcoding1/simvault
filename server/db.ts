@@ -481,8 +481,26 @@ const SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_usage_app_occurred ON usage_events(application_id, occurred_at);
 `;
 
+function stripOuterQuotes(value: string): string {
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2)
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
 export function resolvePostgresUrl(): string | null {
-  const candidate = (process.env.SUPABASE_DB_URL || process.env.DATABASE_URL || '').trim();
+  const raw =
+    process.env.SUPABASE_DB_URL ||
+    process.env.DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    process.env.POSTGRES_PRISMA_URL ||
+    process.env.POSTGRES_URL_NON_POOLING ||
+    '';
+  const candidate = stripOuterQuotes(raw);
   if (!candidate) return null;
   if (/^postgres(ql)?:\/\//i.test(candidate)) {
     return candidate;
@@ -521,6 +539,20 @@ export async function getDb(dbPath?: string): Promise<DbClient> {
   if (dbCache.initPromise) return dbCache.initPromise;
 
   dbCache.initPromise = (async () => {
+    const rawPgCandidate = stripOuterQuotes(
+      process.env.SUPABASE_DB_URL ||
+        process.env.DATABASE_URL ||
+        process.env.POSTGRES_URL ||
+        process.env.POSTGRES_PRISMA_URL ||
+        process.env.POSTGRES_URL_NON_POOLING ||
+        ''
+    );
+    if (dbPath === undefined && rawPgCandidate && /^https?:\/\//i.test(rawPgCandidate)) {
+      throw new Error(
+        'SUPABASE_DB_URL/DATABASE_URL appears to be an https:// API URL. Please paste the PostgreSQL URI (postgresql://...) from Supabase Dashboard -> Connect -> Transaction Pooler (port 6543).'
+      );
+    }
+
     const pgUrl = dbPath === undefined ? resolvePostgresUrl() : null;
 
     let client: DbClient;
@@ -552,9 +584,11 @@ export async function getDb(dbPath?: string): Promise<DbClient> {
       });
       client = pgClient;
     } else {
-      if (process.env.VERCEL && !process.env.SIMVAULT_DB_PATH) {
+      const explicitDbPath = (dbPath !== undefined ? dbPath : process.env.SIMVAULT_DB_PATH)?.trim() ?? '';
+      const allowEphemeralSqliteOnVercel = explicitDbPath === ':memory:' || explicitDbPath.startsWith('/tmp/');
+      if (process.env.VERCEL && !allowEphemeralSqliteOnVercel) {
         throw new Error(
-          'Missing SUPABASE_DB_URL or DATABASE_URL environment variable for Vercel deployment. Add your Supabase PostgreSQL connection string in Vercel Project Settings -> Environment Variables.'
+          'Missing Supabase PostgreSQL connection string for Vercel. Add SUPABASE_DB_URL, DATABASE_URL, or POSTGRES_URL (postgresql://...) in Vercel Project Settings -> Environment Variables, and remove SIMVAULT_DB_PATH.'
         );
       }
 
