@@ -1,5 +1,8 @@
--- SimVault Supabase PostgreSQL Schema
--- Optional manual SQL Editor migration (also auto-applied on first serverless boot)
+-- ==============================================================================
+-- SimVault — Supabase PostgreSQL Schema
+-- Run this SQL in: Supabase Dashboard -> SQL Editor -> New Query -> Run
+-- (All statements are idempotent via IF NOT EXISTS / ON CONFLICT DO NOTHING)
+-- ==============================================================================
 
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -214,6 +217,7 @@ CREATE TABLE IF NOT EXISTS platform_settings (
   updated_at TEXT NOT NULL
 );
 
+-- Indexes for queue polling, idempotency, OTP expiry, and usage reporting
 CREATE INDEX IF NOT EXISTS idx_messages_status_created ON messages(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_app_created ON messages(application_id, created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_app_idempotency ON messages(application_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
@@ -221,3 +225,19 @@ CREATE INDEX IF NOT EXISTS idx_otp_app_exp_status ON otp_challenges(application_
 CREATE INDEX IF NOT EXISTS idx_leases_device_exp ON gateway_job_leases(device_id, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_apikeys_prefix_status ON api_keys(key_prefix, status);
 CREATE INDEX IF NOT EXISTS idx_usage_app_occurred ON usage_events(application_id, occurred_at);
+
+-- Default live-mode platform settings (owner account & default templates are seeded by app boot)
+INSERT INTO platform_settings (key, value, updated_at) VALUES
+  ('global_paused', 'false', NOW()::text),
+  ('live_mode', 'true', NOW()::text),
+  ('migration_live_mode_v2', 'done', NOW()::text),
+  ('otp_ttl_seconds', '300', NOW()::text),
+  ('otp_max_attempts', '5', NOW()::text),
+  ('otp_resend_cooldown_seconds', '45', NOW()::text),
+  ('rate_limit_per_number_hourly', '6', NOW()::text),
+  ('rate_limit_per_ip_minute', '30', NOW()::text),
+  ('lease_timeout_seconds', '30', NOW()::text),
+  ('max_send_retries', '3', NOW()::text),
+  ('retention_days', '30', NOW()::text),
+  ('global_daily_sim_cap', '300', NOW()::text)
+ON CONFLICT (key) DO NOTHING;

@@ -440,20 +440,32 @@ async function getDb(dbPath) {
     const pgUrl = dbPath === void 0 ? resolvePostgresUrl() : null;
     let client;
     if (pgUrl) {
+      let connectionString = pgUrl;
       let useSsl = { rejectUnauthorized: false };
       try {
         const parsed = new URL(pgUrl);
         if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") {
           useSsl = false;
+        } else {
+          const sslMode = parsed.searchParams.get("sslmode");
+          if (sslMode === "verify-full") {
+            useSsl = { rejectUnauthorized: true };
+          } else if (sslMode) {
+            parsed.searchParams.delete("sslmode");
+            connectionString = parsed.toString();
+          }
         }
       } catch {
       }
       const pool = new PgPool({
-        connectionString: pgUrl,
+        connectionString,
         ssl: useSsl,
         max: process.env.VERCEL ? 5 : 10,
         idleTimeoutMillis: 2e4,
         connectionTimeoutMillis: 1e4
+      });
+      pool.on("error", (err) => {
+        console.error("[SimVault pg pool]", err.message);
       });
       const pgClient = new PostgresDbClient(pool);
       try {

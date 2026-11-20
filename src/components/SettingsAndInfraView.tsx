@@ -13,8 +13,7 @@ export function SettingsAndInfraView({ settings, onUpdated }: SettingsAndInfraVi
   const [maxRetries, setMaxRetries] = useState(settings.max_send_retries || '3');
   const [retentionDays, setRetentionDays] = useState(settings.retention_days || '30');
   const [sweeperResult, setSweeperResult] = useState<string | null>(null);
-  const [ubuntuSetupSnippet, setUbuntuSetupSnippet] = useState('');
-  const [nginxSnippet, setNginxSnippet] = useState('');
+  const [vercelSupabaseSnippet, setVercelSupabaseSnippet] = useState('');
   const [saved, setSaved] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -26,10 +25,9 @@ export function SettingsAndInfraView({ settings, onUpdated }: SettingsAndInfraVi
   }, [settings]);
 
   useEffect(() => {
-    apiRequest<{ ubuntu_setup_snippet?: string; ubuntu_nginx_snippet?: string }>('/api/admin/blueprints')
+    apiRequest<{ vercel_supabase_snippet?: string }>('/api/admin/blueprints')
       .then((b) => {
-        setUbuntuSetupSnippet(b.ubuntu_setup_snippet || '');
-        setNginxSnippet(b.ubuntu_nginx_snippet || '');
+        setVercelSupabaseSnippet(b.vercel_supabase_snippet || '');
       })
       .catch(() => {});
   }, []);
@@ -85,7 +83,7 @@ export function SettingsAndInfraView({ settings, onUpdated }: SettingsAndInfraVi
       <div>
         <h2 className="text-base font-semibold text-slate-900">Platform Settings, Kill Switch &amp; Deployment</h2>
         <p className="text-xs text-slate-500 mt-0.5">
-          Live operational controls, queue recovery parameters, compliance boundaries, and Ubuntu VPS systemd + Nginx deployment setup.
+          Live operational controls, queue recovery parameters, compliance boundaries, and Vercel + Supabase PostgreSQL deployment setup.
         </p>
       </div>
 
@@ -211,18 +209,10 @@ export function SettingsAndInfraView({ settings, onUpdated }: SettingsAndInfraVi
             <li>Android <code className="font-mono">SEND_SMS</code> requires explicit user grant and private/managed distribution outside Play restrictions.</li>
           </ul>
           <div className="pt-2 space-y-2">
-            <div className="text-xs font-medium text-slate-700">Ubuntu VPS Deployment (Node 22 + systemd + Nginx)</div>
+            <div className="text-xs font-medium text-slate-700">Vercel + Supabase PostgreSQL Setup (.env &amp; SQL)</div>
             <pre className="bg-slate-900 text-slate-200 rounded p-3 text-[11px] font-mono overflow-x-auto leading-relaxed">
-              {ubuntuSetupSnippet}
+              {vercelSupabaseSnippet}
             </pre>
-            {nginxSnippet && (
-              <>
-                <div className="text-xs font-medium text-slate-700 pt-1">Nginx Reverse Proxy (deploy/nginx-simvault.conf)</div>
-                <pre className="bg-slate-900 text-slate-200 rounded p-3 text-[11px] font-mono overflow-x-auto leading-relaxed">
-                  {nginxSnippet}
-                </pre>
-              </>
-            )}
           </div>
         </div>
       </div>

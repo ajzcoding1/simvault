@@ -520,20 +520,32 @@ async function getDb(dbPath) {
     const pgUrl = dbPath === void 0 ? resolvePostgresUrl() : null;
     let client;
     if (pgUrl) {
+      let connectionString = pgUrl;
       let useSsl = { rejectUnauthorized: false };
       try {
         const parsed = new URL(pgUrl);
         if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") {
           useSsl = false;
+        } else {
+          const sslMode = parsed.searchParams.get("sslmode");
+          if (sslMode === "verify-full") {
+            useSsl = { rejectUnauthorized: true };
+          } else if (sslMode) {
+            parsed.searchParams.delete("sslmode");
+            connectionString = parsed.toString();
+          }
         }
       } catch {
       }
       const pool = new PgPool({
-        connectionString: pgUrl,
+        connectionString,
         ssl: useSsl,
         max: process.env.VERCEL ? 5 : 10,
         idleTimeoutMillis: 2e4,
         connectionTimeoutMillis: 1e4
+      });
+      pool.on("error", (err) => {
+        console.error("[SimVault pg pool]", err.message);
       });
       const pgClient = new PostgresDbClient(pool);
       try {
@@ -3724,17 +3736,29 @@ class SmsDispatchWorker(ctx: Context, params: WorkerParameters) : CoroutineWorke
     return Result.success()
   }
 }`,
-      ubuntu_setup_snippet: `# 1. Auto Setup (Node 22 + systemd + Nginx + SSL):
+      vercel_supabase_snippet: `# 1. Create Supabase tables (Supabase Dashboard -> SQL Editor):
+#    Paste & run infra/supabase_schema.sql
+
+# 2. Configure .env (local) or Vercel -> Project Settings -> Environment Variables:
+SUPABASE_DB_URL="postgresql://postgres.<PROJECT_REF>:<PASSWORD>@aws-0-<REGION>.pooler.supabase.com:6543/postgres"
+# OR use separate fields instead of SUPABASE_DB_URL:
+# SUPABASE_URL="https://<PROJECT_REF>.supabase.co"
+# SUPABASE_DB_PASSWORD="your-db-password"
+# SUPABASE_DB_REGION="ap-south-1"
+
+API_KEY_PEPPER="<64-hex-secret>"
+JWT_PRIVATE_KEY="<64-hex-secret>"
+OTP_PEPPER="<64-hex-secret>"
+FIELD_ENCRYPTION_KEY="<64-hex-secret>"
+SIMVAULT_ADMIN_EMAIL="owner@yourdomain.com"
+SIMVAULT_ADMIN_PASSWORD="ChangeThisStrongPassword!"
+CRON_SECRET="<48-hex-secret>"
+
+# 3. Build & Deploy to Vercel:
+npm run build`,
+      ubuntu_setup_snippet: `# Optional Self-Hosted VPS (Node 22 + systemd + Nginx):
 sudo bash deploy/ubuntu-setup.sh sms.yourdomain.com owner@yourdomain.com
-
-# 2. Manual Build & Production Start:
-npm ci && npm run build
-NODE_ENV=production npm run start:prod
-
-# 3. Manage systemd service:
-sudo systemctl status simvault
-sudo systemctl restart simvault
-sudo journalctl -u simvault -f`,
+npm ci && npm run build && NODE_ENV=production npm run start:prod`,
       ubuntu_nginx_snippet: `server {
   listen 80;
   server_name sms.yourdomain.com;
