@@ -142,8 +142,12 @@ export default function App() {
       ]);
       setOverview(ov);
       setApplications(apps.applications);
+      setLoginError(null);
       setAuthChecked(true);
-    } catch {
+    } catch (err) {
+      if (err instanceof Error && err.message) {
+        setLoginError(err.message);
+      }
       setAuthChecked(true);
     } finally {
       setLoading(false);

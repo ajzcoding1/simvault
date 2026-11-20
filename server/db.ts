@@ -1,11 +1,13 @@
-import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
+import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { Pool, type PoolClient } from 'pg';
+import pg, { type Pool, type PoolClient } from 'pg';
 import { generateTotpSecret, hashPassword } from './crypto';
 import { redactSensitiveMetadata } from '../src/shared/smsRules';
+
+const { Pool: PgPool } = pg;
 
 export interface RunResult {
   changes: number;
@@ -533,7 +535,7 @@ export async function getDb(dbPath?: string): Promise<DbClient> {
         // Keep SSL enabled for non-URL connection strings
       }
 
-      const pool = new Pool({
+      const pool = new PgPool({
         connectionString: pgUrl,
         ssl: useSsl,
         max: process.env.VERCEL ? 5 : 10,
@@ -572,7 +574,8 @@ export async function getDb(dbPath?: string): Promise<DbClient> {
 
       let rawDb: DatabaseSync;
       try {
-        rawDb = new DatabaseSync(targetPath);
+        const { DatabaseSync: SqliteDatabaseSync } = await import('node:sqlite');
+        rawDb = new SqliteDatabaseSync(targetPath);
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         throw new Error(
@@ -610,7 +613,8 @@ export async function closeDb(): Promise<void> {
 }
 
 export async function createIsolatedTestDb(): Promise<DbClient> {
-  const rawDb = new DatabaseSync(':memory:');
+  const { DatabaseSync: SqliteDatabaseSync } = await import('node:sqlite');
+  const rawDb = new SqliteDatabaseSync(':memory:');
   rawDb.exec('PRAGMA foreign_keys = ON;');
   const client = new SqliteDbClient(rawDb);
   await migrateSchema(client);
