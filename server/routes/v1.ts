@@ -1,8 +1,7 @@
 import crypto from 'node:crypto';
 import { Router, Request, Response, NextFunction } from 'express';
-import { DatabaseSync } from 'node:sqlite';
 import { generateDeviceToken, hashApiKey, hashToken } from '../crypto';
-import { writeAuditLog } from '../db';
+import { DbClient, writeAuditLog } from '../db';
 import {
   AppError,
   authenticateApiKey,
@@ -45,7 +44,7 @@ function sendError(res: Response, err: unknown, requestId: string): void {
   });
 }
 
-export function createV1Router(db: DatabaseSync): Router {
+export function createV1Router(db: DbClient): Router {
   const router = Router();
 
   router.use((req: Request, _res: Response, next: NextFunction) => {
@@ -103,9 +102,9 @@ export function createV1Router(db: DatabaseSync): Router {
   });
 
   // POST /v1/sms
-  router.post('/sms', (req: Request, res: Response) => {
+  router.post('/sms', async (req: Request, res: Response) => {
     try {
-      const ctx = authenticateApiKey(db, getBearer(req), hashApiKey);
+      const ctx = await authenticateApiKey(db, getBearer(req), hashApiKey);
       requireScope(ctx, 'sms:send');
 
       const { to, template_id, variables, purpose, ttl_seconds } = req.body ?? {};
@@ -114,7 +113,7 @@ export function createV1Router(db: DatabaseSync): Router {
       }
       const idempotencyKey = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'].trim() : undefined;
 
-      const result = createSmsRequest(db, {
+      const result = await createSmsRequest(db, {
         applicationId: ctx.applicationId,
         to: String(to),
         templateCode: String(template_id),
@@ -139,9 +138,9 @@ export function createV1Router(db: DatabaseSync): Router {
   });
 
   // POST /v1/otp/challenges
-  router.post('/otp/challenges', (req: Request, res: Response) => {
+  router.post('/otp/challenges', async (req: Request, res: Response) => {
     try {
-      const ctx = authenticateApiKey(db, getBearer(req), hashApiKey);
+      const ctx = await authenticateApiKey(db, getBearer(req), hashApiKey);
       requireScope(ctx, 'otp:create');
 
       const { to, purpose, ttl_seconds } = req.body ?? {};
@@ -149,7 +148,7 @@ export function createV1Router(db: DatabaseSync): Router {
         throw new AppError(400, 'BAD_REQUEST', 'Fields to and purpose are required.');
       }
 
-      const result = createOtpChallenge(db, {
+      const result = await createOtpChallenge(db, {
         applicationId: ctx.applicationId,
         to: String(to),
         purpose: String(purpose),
@@ -170,9 +169,9 @@ export function createV1Router(db: DatabaseSync): Router {
   });
 
   // POST /v1/otp/verify
-  router.post('/otp/verify', (req: Request, res: Response) => {
+  router.post('/otp/verify', async (req: Request, res: Response) => {
     try {
-      const ctx = authenticateApiKey(db, getBearer(req), hashApiKey);
+      const ctx = await authenticateApiKey(db, getBearer(req), hashApiKey);
       requireScope(ctx, 'otp:verify');
 
       const { challenge_id, code } = req.body ?? {};
@@ -180,7 +179,7 @@ export function createV1Router(db: DatabaseSync): Router {
         throw new AppError(400, 'BAD_REQUEST', 'Fields challenge_id and code are required.');
       }
 
-      const verified = verifyOtpChallenge(db, {
+      const verified = await verifyOtpChallenge(db, {
         applicationId: ctx.applicationId,
         challengeId: String(challenge_id),
         code: String(code),
@@ -194,16 +193,16 @@ export function createV1Router(db: DatabaseSync): Router {
   });
 
   // GET /v1/messages/:id
-  router.get('/messages/:id', (req: Request, res: Response) => {
+  router.get('/messages/:id', async (req: Request, res: Response) => {
     try {
-      const ctx = authenticateApiKey(db, getBearer(req), hashApiKey);
-      const row = db
-        .prepare(
-          `SELECT id, application_id, device_id, destination_masked, template_id, purpose, status, is_test,
-                  created_at, queued_at, leased_at, accepted_at, sent_at, delivered_at, failed_at, error_code
-           FROM messages WHERE id = ? AND application_id = ?`
-        )
-        .get(req.params.id, ctx.applicationId);
+      const ctx = await authenticateApiKey(db, getBearer(req), hashApiKey);
+      const row = await db.get(
+        `SELECT id, application_id, device_id, destination_masked, template_id, purpose, status, is_test,
+                created_at, queued_at, leased_at, accepted_at, sent_at, delivered_at, failed_at, error_code
+         FROM messages WHERE id = ? AND application_id = ?`,
+        req.params.id,
+        ctx.applicationId
+      );
 
       if (!row) {
         throw new AppError(404, 'NOT_FOUND', 'Message not found.');
@@ -215,28 +214,29 @@ export function createV1Router(db: DatabaseSync): Router {
   });
 
   // GET /v1/usage
-  router.get('/usage', (req: Request, res: Response) => {
+  router.get('/usage', async (req: Request, res: Response) => {
     try {
-      const ctx = authenticateApiKey(db, getBearer(req), hashApiKey);
+      const ctx = await authenticateApiKey(db, getBearer(req), hashApiKey);
       requireScope(ctx, 'usage:read');
 
       const from = typeof req.query.from === 'string' ? req.query.from : new Date(Date.now() - 30 * 86400_000).toISOString();
       const to = typeof req.query.to === 'string' ? req.query.to : new Date().toISOString();
 
-      const byStatus = db
-        .prepare(
-          `SELECT status, COUNT(*) as count
-           FROM messages
-           WHERE application_id = ? AND created_at >= ? AND created_at <= ?
-           GROUP BY status`
-        )
-        .all(ctx.applicationId, from, to);
+      const byStatus = await db.all<{ status: string; count: number | string }>(
+        `SELECT status, COUNT(*) as count
+         FROM messages
+         WHERE application_id = ? AND created_at >= ? AND created_at <= ?
+         GROUP BY status`,
+        ctx.applicationId,
+        from,
+        to
+      );
 
       res.json({
         application_id: ctx.applicationId,
         from,
         to,
-        counts_by_status: byStatus,
+        counts_by_status: byStatus.map((r) => ({ status: r.status, count: Number(r.count ?? 0) })),
       });
     } catch (err) {
       sendError(res, err, getReqId(req));
@@ -245,7 +245,7 @@ export function createV1Router(db: DatabaseSync): Router {
 
   // --- Gateway Device Endpoints (authenticated with device credential, never app API key) ---
 
-  router.post('/gateway/enroll', (req: Request, res: Response) => {
+  router.post('/gateway/enroll', async (req: Request, res: Response) => {
     try {
       const { enrollment_token, device_name, app_version, android_version } = req.body ?? {};
       if (!enrollment_token) {
@@ -253,11 +253,10 @@ export function createV1Router(db: DatabaseSync): Router {
       }
 
       const tokenHash = hashToken(String(enrollment_token));
-      const enrollRow = db
-        .prepare('SELECT id, device_name, expires_at, used_at FROM enrollment_tokens WHERE token_hash = ?')
-        .get(tokenHash) as
-        | { id: string; device_name: string; expires_at: string; used_at: string | null }
-        | undefined;
+      const enrollRow = await db.get<{ id: string; device_name: string; expires_at: string; used_at: string | null }>(
+        'SELECT id, device_name, expires_at, used_at FROM enrollment_tokens WHERE token_hash = ?',
+        tokenHash
+      );
 
       if (!enrollRow || enrollRow.used_at || new Date(enrollRow.expires_at).getTime() <= Date.now()) {
         throw new AppError(401, 'INVALID_ENROLLMENT_TOKEN', 'Enrollment token is invalid, expired, or already used.');
@@ -270,13 +269,19 @@ export function createV1Router(db: DatabaseSync): Router {
       const deviceId = `dev_${crypto.randomBytes(5).toString('hex')}`;
       const devCred = generateDeviceToken();
 
-      db.exec('BEGIN IMMEDIATE;');
-      try {
-        db.prepare('UPDATE enrollment_tokens SET used_at = ? WHERE id = ?').run(nowIso, enrollRow.id);
-        db.prepare(
+      await db.transaction(async (tx) => {
+        const claim = await tx.run(
+          'UPDATE enrollment_tokens SET used_at = ? WHERE id = ? AND used_at IS NULL',
+          nowIso,
+          enrollRow.id
+        );
+        if (claim.changes === 0) {
+          throw new AppError(401, 'INVALID_ENROLLMENT_TOKEN', 'Enrollment token is invalid, expired, or already used.');
+        }
+
+        await tx.run(
           `INSERT INTO gateway_devices (id, name, device_token_hash, status, app_version, android_version, permission_send_sms, network_type, battery_pct, sim_ready, last_heartbeat_at, enrolled_at)
-           VALUES (?, ?, ?, 'online', ?, ?, 1, 'Pending Heartbeat', 100, 0, ?, ?)`
-        ).run(
+           VALUES (?, ?, ?, 'online', ?, ?, 1, 'Pending Heartbeat', 100, 0, ?, ?)`,
           deviceId,
           String(device_name || enrollRow.device_name).slice(0, 80),
           devCred.tokenHash,
@@ -285,10 +290,9 @@ export function createV1Router(db: DatabaseSync): Router {
           nowIso,
           nowIso
         );
-        db.prepare(
+        await tx.run(
           `INSERT INTO sims (id, device_id, carrier_label, masked_msisdn, slot_index, plan_sms_limit, period_start, period_end, estimated_sms_sent, estimated_sms_remaining, warning_threshold, notes, updated_at)
-           VALUES (?, ?, ?, ?, 0, 3000, ?, ?, 0, 3000, 300, ?, ?)`
-        ).run(
+           VALUES (?, ?, ?, ?, 0, 3000, ?, ?, 0, 3000, 300, ?, ?)`,
           `sim_${deviceId}_0`,
           deviceId,
           'Active SIM Slot 0',
@@ -298,13 +302,9 @@ export function createV1Router(db: DatabaseSync): Router {
           'Live SIM — reconcile monthly against your carrier statement.',
           nowIso
         );
-        db.exec('COMMIT;');
-      } catch (e) {
-        db.exec('ROLLBACK;');
-        throw e;
-      }
+      });
 
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'device',
         actorId: deviceId,
         action: 'gateway.device_enrolled',
@@ -324,9 +324,9 @@ export function createV1Router(db: DatabaseSync): Router {
     }
   });
 
-  router.post('/gateway/heartbeat', (req: Request, res: Response) => {
+  router.post('/gateway/heartbeat', async (req: Request, res: Response) => {
     try {
-      const dev = authenticateGatewayDevice(db, getBearer(req));
+      const dev = await authenticateGatewayDevice(db, getBearer(req));
       const {
         app_version,
         android_version,
@@ -346,7 +346,7 @@ export function createV1Router(db: DatabaseSync): Router {
           ? Math.max(0, Math.min(100, Math.round(battery_pct)))
           : null;
 
-      db.prepare(
+      await db.run(
         `UPDATE gateway_devices
          SET status = ?,
              app_version = COALESCE(?, app_version),
@@ -356,8 +356,7 @@ export function createV1Router(db: DatabaseSync): Router {
              battery_pct = COALESCE(?, battery_pct),
              sim_ready = COALESCE(?, sim_ready),
              last_heartbeat_at = ?
-         WHERE id = ?`
-      ).run(
+         WHERE id = ?`,
         nextStatus,
         app_version ? String(app_version).slice(0, 32) : null,
         android_version ? String(android_version).slice(0, 40) : null,
@@ -371,17 +370,18 @@ export function createV1Router(db: DatabaseSync): Router {
 
       if (carrier_label || masked_msisdn || typeof sim_slot === 'number') {
         const slotIdx = typeof sim_slot === 'number' && Number.isFinite(sim_slot) ? Math.max(0, Math.min(3, Math.trunc(sim_slot))) : 0;
-        const simRow = db.prepare('SELECT id FROM sims WHERE device_id = ? AND slot_index = ?').get(dev.id, slotIdx) as
-          | { id: string }
-          | undefined;
+        const simRow = await db.get<{ id: string }>(
+          'SELECT id FROM sims WHERE device_id = ? AND slot_index = ?',
+          dev.id,
+          slotIdx
+        );
         if (simRow) {
-          db.prepare(
+          await db.run(
             `UPDATE sims
              SET carrier_label = COALESCE(?, carrier_label),
                  masked_msisdn = COALESCE(?, masked_msisdn),
                  updated_at = ?
-             WHERE id = ?`
-          ).run(
+             WHERE id = ?`,
             carrier_label ? String(carrier_label).slice(0, 64) : null,
             masked_msisdn ? String(masked_msisdn).slice(0, 32) : null,
             nowIso,
@@ -390,10 +390,9 @@ export function createV1Router(db: DatabaseSync): Router {
         } else {
           const cycleStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
           const cycleEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().slice(0, 10);
-          db.prepare(
+          await db.run(
             `INSERT INTO sims (id, device_id, carrier_label, masked_msisdn, slot_index, plan_sms_limit, period_start, period_end, estimated_sms_sent, estimated_sms_remaining, warning_threshold, notes, updated_at)
-             VALUES (?, ?, ?, ?, ?, 3000, ?, ?, 0, 3000, 300, ?, ?)`
-          ).run(
+             VALUES (?, ?, ?, ?, ?, 3000, ?, ?, 0, 3000, 300, ?, ?)`,
             `sim_${dev.id}_${slotIdx}`,
             dev.id,
             carrier_label ? String(carrier_label).slice(0, 64) : `SIM Slot ${slotIdx}`,
@@ -413,10 +412,10 @@ export function createV1Router(db: DatabaseSync): Router {
     }
   });
 
-  router.get('/gateway/jobs/next', (req: Request, res: Response) => {
+  router.get('/gateway/jobs/next', async (req: Request, res: Response) => {
     try {
-      const dev = authenticateGatewayDevice(db, getBearer(req));
-      const job = leaseNextGatewayJob(db, dev.id);
+      const dev = await authenticateGatewayDevice(db, getBearer(req));
+      const job = await leaseNextGatewayJob(db, dev.id);
       if (!job) {
         res.status(204).end();
         return;
@@ -427,34 +426,34 @@ export function createV1Router(db: DatabaseSync): Router {
     }
   });
 
-  router.post('/gateway/jobs/:id/accepted', (req: Request, res: Response) => {
+  router.post('/gateway/jobs/:id/accepted', async (req: Request, res: Response) => {
     try {
-      const dev = authenticateGatewayDevice(db, getBearer(req));
-      const result = markJobAcceptedByDevice(db, dev.id, req.params.id);
+      const dev = await authenticateGatewayDevice(db, getBearer(req));
+      const result = await markJobAcceptedByDevice(db, dev.id, req.params.id);
       res.json({ job_id: req.params.id, ...result });
     } catch (err) {
       sendError(res, err, getReqId(req));
     }
   });
 
-  router.post('/gateway/jobs/:id/result', (req: Request, res: Response) => {
+  router.post('/gateway/jobs/:id/result', async (req: Request, res: Response) => {
     try {
-      const dev = authenticateGatewayDevice(db, getBearer(req));
+      const dev = await authenticateGatewayDevice(db, getBearer(req));
       const { status, error_code } = req.body ?? {};
       if (!['sent_to_network', 'failed', 'delivery_unknown'].includes(status)) {
         throw new AppError(400, 'BAD_REQUEST', 'status must be sent_to_network, failed, or delivery_unknown.');
       }
-      const result = reportJobResult(db, dev.id, req.params.id, status, error_code);
+      const result = await reportJobResult(db, dev.id, req.params.id, status, error_code);
       res.json({ job_id: req.params.id, ...result });
     } catch (err) {
       sendError(res, err, getReqId(req));
     }
   });
 
-  router.post('/gateway/jobs/:id/delivery-report', (req: Request, res: Response) => {
+  router.post('/gateway/jobs/:id/delivery-report', async (req: Request, res: Response) => {
     try {
-      const dev = authenticateGatewayDevice(db, getBearer(req));
-      const result = reportDeliveryReceipt(db, dev.id, req.params.id);
+      const dev = await authenticateGatewayDevice(db, getBearer(req));
+      const result = await reportDeliveryReceipt(db, dev.id, req.params.id);
       res.json({ job_id: req.params.id, ...result });
     } catch (err) {
       sendError(res, err, getReqId(req));

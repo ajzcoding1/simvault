@@ -14,10 +14,13 @@ function resolveKeysPath(): string {
   return path.resolve(process.cwd(), expanded);
 }
 
+let warnedMissingEnvKeys = false;
+
 function loadOrCreateRuntimeKeys(): Record<KeyName, string> {
   if (runtimeKeysCache) return runtimeKeysCache;
 
   const isInMemory = process.env.NODE_ENV === 'test' || process.env.SIMVAULT_DB_PATH === ':memory:';
+  const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
   const keysPath = resolveKeysPath();
 
   if (!isInMemory && fs.existsSync(keysPath)) {
@@ -44,9 +47,18 @@ function loadOrCreateRuntimeKeys(): Record<KeyName, string> {
     FIELD_ENCRYPTION_KEY: crypto.randomBytes(32).toString('hex'),
   };
 
-  if (!isInMemory) {
-    fs.mkdirSync(path.dirname(keysPath), { recursive: true });
-    fs.writeFileSync(keysPath, JSON.stringify(generated, null, 2), { mode: 0o600 });
+  if (!isInMemory && !isServerless) {
+    try {
+      fs.mkdirSync(path.dirname(keysPath), { recursive: true });
+      fs.writeFileSync(keysPath, JSON.stringify(generated, null, 2), { mode: 0o600 });
+    } catch {
+      // Ignore write failures on read-only filesystems
+    }
+  } else if (isServerless && !warnedMissingEnvKeys) {
+    warnedMissingEnvKeys = true;
+    console.warn(
+      '[SimVault] Missing API_KEY_PEPPER/JWT_PRIVATE_KEY/OTP_PEPPER/FIELD_ENCRYPTION_KEY env vars in serverless environment; using ephemeral runtime keys.'
+    );
   }
 
   runtimeKeysCache = generated;

@@ -18,7 +18,7 @@ android {
         buildConfigField(
             "String",
             "DEFAULT_SERVER_URL",
-            "\"https://ais-dev-afiulnykhks2enbr7373v4-124123308666.asia-southeast1.run.app\""
+            "\"https://ais-dev-pthv5xe5qez4dsgwiic2le-124123308666.asia-southeast1.run.app\""
         )
     }
 

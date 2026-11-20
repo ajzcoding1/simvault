@@ -13,8 +13,12 @@ export function TemplatesView() {
   const [err, setErr] = useState<string | null>(null);
 
   const loadTemplates = async () => {
-    const res = await apiRequest<{ templates: TemplateRecord[] }>('/api/admin/templates');
-    setTemplates(res.templates);
+    try {
+      const res = await apiRequest<{ templates: TemplateRecord[] }>('/api/admin/templates');
+      setTemplates(res.templates);
+    } catch (error) {
+      setErr(error instanceof Error ? error.message : 'Failed to load templates');
+    }
   };
 
   useEffect(() => {

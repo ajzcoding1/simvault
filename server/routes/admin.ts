@@ -2,9 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Router, Request, Response, NextFunction } from 'express';
-import { DatabaseSync } from 'node:sqlite';
 import {
-  decryptField,
   encryptField,
   generateApiKey,
   generateEnrollmentToken,
@@ -15,7 +13,7 @@ import {
   verifyPassword,
   verifyTotpCode,
 } from '../crypto';
-import { writeAuditLog } from '../db';
+import { DbClient, writeAuditLog } from '../db';
 import {
   AppError,
   assertPublicWebhookHost,
@@ -24,6 +22,7 @@ import {
   createOtpChallenge,
   createSmsRequest,
   getSettingsMap,
+  maybeRunOpportunisticSweep,
   recordLoginFailure,
   runSweeperTick,
   updateSetting,
@@ -52,60 +51,61 @@ function isHttpsRequest(req: Request): boolean {
   return req.secure || (typeof xfProto === 'string' && xfProto.split(',')[0].trim() === 'https');
 }
 
-export function createAdminRouter(db: DatabaseSync): Router {
+export function createAdminRouter(db: DbClient): Router {
   const router = Router();
 
   // Strict owner session authentication & CSRF validation
-  router.use((req: Request, res: Response, next: NextFunction) => {
-    const cookieHeader = req.headers.cookie ?? '';
-    const match = /simvault_session=([^;]+)/.exec(cookieHeader);
-    let user: { id: string; email: string; role: string; mfa_enabled: number } | undefined;
-    let sessionCsrf: string | null = null;
-    let currentTokenHash: string | null = null;
+  router.use(async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const cookieHeader = req.headers.cookie ?? '';
+      const match = /simvault_session=([^;]+)/.exec(cookieHeader);
+      let user: { id: string; email: string; role: string; mfa_enabled: number } | undefined;
+      let sessionCsrf: string | null = null;
+      let currentTokenHash: string | null = null;
 
-    if (match) {
-      const tokHash = hashToken(decodeURIComponent(match[1]));
-      const sess = db
-        .prepare(
+      if (match) {
+        const tokHash = hashToken(decodeURIComponent(match[1]));
+        const sess = await db.get<{
+          csrf_token: string;
+          expires_at: string;
+          mfa_verified: number;
+          id: string;
+          email: string;
+          role: string;
+          mfa_enabled: number;
+        }>(
           `SELECT s.csrf_token, s.expires_at, s.mfa_verified, u.id, u.email, u.role, u.mfa_enabled
            FROM sessions s JOIN users u ON u.id = s.user_id
-           WHERE s.token_hash = ?`
-        )
-        .get(tokHash) as
-        | {
-            csrf_token: string;
-            expires_at: string;
-            mfa_verified: number;
-            id: string;
-            email: string;
-            role: string;
-            mfa_enabled: number;
-          }
-        | undefined;
-      if (sess && new Date(sess.expires_at).getTime() > Date.now() && sess.mfa_verified) {
-        user = { id: sess.id, email: sess.email, role: sess.role, mfa_enabled: sess.mfa_enabled };
-        sessionCsrf = sess.csrf_token;
-        currentTokenHash = tokHash;
+           WHERE s.token_hash = ?`,
+          tokHash
+        );
+        if (sess && new Date(sess.expires_at).getTime() > Date.now() && sess.mfa_verified) {
+          user = { id: sess.id, email: sess.email, role: sess.role, mfa_enabled: sess.mfa_enabled };
+          sessionCsrf = sess.csrf_token;
+          currentTokenHash = tokHash;
+        }
       }
-    }
 
-    (req as Request & { ownerUser?: typeof user; csrfToken?: string | null; currentTokenHash?: string | null }).ownerUser = user;
-    (req as Request & { csrfToken?: string | null }).csrfToken = sessionCsrf;
-    (req as Request & { currentTokenHash?: string | null }).currentTokenHash = currentTokenHash;
+      (req as Request & { ownerUser?: typeof user; csrfToken?: string | null; currentTokenHash?: string | null }).ownerUser = user;
+      (req as Request & { csrfToken?: string | null }).csrfToken = sessionCsrf;
+      (req as Request & { currentTokenHash?: string | null }).currentTokenHash = currentTokenHash;
 
-    const isAuthRoute = req.path.startsWith('/auth/');
-    if (!user && !isAuthRoute) {
-      res.status(401).json({ error: { code: 'AUTH_REQUIRED', message: 'Owner authentication required.' } });
-      return;
-    }
-    if (!isAuthRoute && ['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method)) {
-      const providedCsrf = req.headers['x-csrf-token'];
-      if (!sessionCsrf || typeof providedCsrf !== 'string' || providedCsrf !== sessionCsrf) {
-        res.status(403).json({ error: { code: 'CSRF_INVALID', message: 'Invalid or missing CSRF token.' } });
+      const isAuthRoute = req.path.startsWith('/auth/');
+      if (!user && !isAuthRoute) {
+        res.status(401).json({ error: { code: 'AUTH_REQUIRED', message: 'Owner authentication required.' } });
         return;
       }
+      if (!isAuthRoute && ['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method)) {
+        const providedCsrf = req.headers['x-csrf-token'];
+        if (!sessionCsrf || typeof providedCsrf !== 'string' || providedCsrf !== sessionCsrf) {
+          res.status(403).json({ error: { code: 'CSRF_INVALID', message: 'Invalid or missing CSRF token.' } });
+          return;
+        }
+      }
+      next();
+    } catch (err) {
+      sendAdminError(res, err);
     }
-    next();
   });
 
   const getOwner = (req: Request) =>
@@ -131,7 +131,7 @@ export function createAdminRouter(db: DatabaseSync): Router {
     });
   });
 
-  router.post('/auth/login', (req: Request, res: Response) => {
+  router.post('/auth/login', async (req: Request, res: Response) => {
     try {
       const clientIp = req.ip || '127.0.0.1';
       if (!checkLoginRateLimit(clientIp)) {
@@ -140,22 +140,18 @@ export function createAdminRouter(db: DatabaseSync): Router {
 
       const { email, password, totp_code } = req.body ?? {};
       const cleanEmail = String(email ?? '').trim().toLowerCase();
-      const user = db.prepare('SELECT id, email, password_hash, role, mfa_enabled, mfa_secret FROM users WHERE email = ?').get(
-        cleanEmail
-      ) as
-        | {
-            id: string;
-            email: string;
-            password_hash: string;
-            role: string;
-            mfa_enabled: number;
-            mfa_secret: string | null;
-          }
-        | undefined;
+      const user = await db.get<{
+        id: string;
+        email: string;
+        password_hash: string;
+        role: string;
+        mfa_enabled: number;
+        mfa_secret: string | null;
+      }>('SELECT id, email, password_hash, role, mfa_enabled, mfa_secret FROM users WHERE email = ?', cleanEmail);
 
       if (!user || !verifyPassword(String(password ?? ''), user.password_hash)) {
         recordLoginFailure(clientIp);
-        writeAuditLog(db, {
+        await writeAuditLog(db, {
           actorType: 'system',
           actorId: 'auth_guard',
           action: 'owner.login_failed',
@@ -174,7 +170,7 @@ export function createAdminRouter(db: DatabaseSync): Router {
         }
         if (!verifyTotpCode(user.mfa_secret, String(totp_code))) {
           recordLoginFailure(clientIp);
-          writeAuditLog(db, {
+          await writeAuditLog(db, {
             actorType: 'owner',
             actorId: user.id,
             action: 'owner.login_failed',
@@ -193,12 +189,18 @@ export function createAdminRouter(db: DatabaseSync): Router {
       const nowIso = new Date().toISOString();
       const expiresAt = new Date(Date.now() + 24 * 3600_000).toISOString();
 
-      db.prepare(
+      await db.run(
         `INSERT INTO sessions (id, user_id, token_hash, csrf_token, mfa_verified, expires_at, created_at)
-         VALUES (?, ?, ?, ?, 1, ?, ?)`
-      ).run(crypto.randomUUID(), user.id, hashToken(rawToken), csrfToken, expiresAt, nowIso);
+         VALUES (?, ?, ?, ?, 1, ?, ?)`,
+        crypto.randomUUID(),
+        user.id,
+        hashToken(rawToken),
+        csrfToken,
+        expiresAt,
+        nowIso
+      );
 
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: user.id,
         action: 'owner.login',
@@ -208,10 +210,11 @@ export function createAdminRouter(db: DatabaseSync): Router {
         ipAddress: clientIp,
       });
 
-      const secureFlag = isHttpsRequest(req) ? '; Secure' : '';
+      const isHttps = isHttpsRequest(req);
+      const cookiePolicy = isHttps ? 'SameSite=None; Secure; Partitioned' : 'SameSite=Lax';
       res.setHeader('Set-Cookie', [
-        `simvault_session=${encodeURIComponent(rawToken)}; Path=/; HttpOnly; SameSite=Lax${secureFlag}`,
-        `simvault_locked=; Path=/; Max-Age=0; SameSite=Lax${secureFlag}`,
+        `simvault_session=${encodeURIComponent(rawToken)}; Path=/; HttpOnly; ${cookiePolicy}`,
+        `simvault_locked=; Path=/; Max-Age=0; ${cookiePolicy}`,
       ]);
       res.json({
         authenticated: true,
@@ -223,21 +226,26 @@ export function createAdminRouter(db: DatabaseSync): Router {
     }
   });
 
-  router.post('/auth/logout', (req: Request, res: Response) => {
-    const cookieHeader = req.headers.cookie ?? '';
-    const match = /simvault_session=([^;]+)/.exec(cookieHeader);
-    if (match) {
-      db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashToken(decodeURIComponent(match[1])));
+  router.post('/auth/logout', async (req: Request, res: Response) => {
+    try {
+      const cookieHeader = req.headers.cookie ?? '';
+      const match = /simvault_session=([^;]+)/.exec(cookieHeader);
+      if (match) {
+        await db.run('DELETE FROM sessions WHERE token_hash = ?', hashToken(decodeURIComponent(match[1])));
+      }
+      const isHttps = isHttpsRequest(req);
+      const cookiePolicy = isHttps ? 'SameSite=None; Secure; Partitioned' : 'SameSite=Lax';
+      res.setHeader('Set-Cookie', [
+        `simvault_session=; Path=/; Max-Age=0; HttpOnly; ${cookiePolicy}`,
+        `simvault_locked=; Path=/; Max-Age=0; HttpOnly; ${cookiePolicy}`,
+      ]);
+      res.json({ ok: true });
+    } catch (err) {
+      sendAdminError(res, err);
     }
-    const secureFlag = isHttpsRequest(req) ? '; Secure' : '';
-    res.setHeader('Set-Cookie', [
-      `simvault_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secureFlag}`,
-      `simvault_locked=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secureFlag}`,
-    ]);
-    res.json({ ok: true });
   });
 
-  router.post('/security/password', (req: Request, res: Response) => {
+  router.post('/security/password', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const currentTokenHash = (req as Request & { currentTokenHash?: string | null }).currentTokenHash;
@@ -247,20 +255,21 @@ export function createAdminRouter(db: DatabaseSync): Router {
         throw new AppError(422, 'WEAK_PASSWORD', 'New password must be at least 10 characters long.');
       }
 
-      const userRow = db.prepare('SELECT id, password_hash FROM users WHERE id = ?').get(owner.id) as
-        | { id: string; password_hash: string }
-        | undefined;
+      const userRow = await db.get<{ id: string; password_hash: string }>(
+        'SELECT id, password_hash FROM users WHERE id = ?',
+        owner.id
+      );
       if (!userRow || !verifyPassword(String(current_password ?? ''), userRow.password_hash)) {
         throw new AppError(401, 'INVALID_CURRENT_PASSWORD', 'Current password is incorrect.');
       }
 
       const nowIso = new Date().toISOString();
-      db.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?').run(hashPassword(nextPass), nowIso, owner.id);
+      await db.run('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?', hashPassword(nextPass), nowIso, owner.id);
       if (currentTokenHash) {
-        db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(owner.id, currentTokenHash);
+        await db.run('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?', owner.id, currentTokenHash);
       }
 
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: owner.id,
         action: 'owner.password_changed',
@@ -275,35 +284,39 @@ export function createAdminRouter(db: DatabaseSync): Router {
     }
   });
 
-  router.get('/security/mfa', (req: Request, res: Response) => {
-    const owner = getOwner(req);
-    const user = db.prepare('SELECT email, mfa_enabled, mfa_secret FROM users WHERE id = ?').get(owner.id) as {
-      email: string;
-      mfa_enabled: number;
-      mfa_secret: string | null;
-    };
-    const secret = user.mfa_secret || generateTotpSecret();
-    if (!user.mfa_secret) {
-      db.prepare('UPDATE users SET mfa_secret = ? WHERE id = ?').run(secret, owner.id);
+  router.get('/security/mfa', async (req: Request, res: Response) => {
+    try {
+      const owner = getOwner(req);
+      const user = await db.get<{ email: string; mfa_enabled: number; mfa_secret: string | null }>(
+        'SELECT email, mfa_enabled, mfa_secret FROM users WHERE id = ?',
+        owner.id
+      );
+      if (!user) throw new AppError(404, 'NOT_FOUND', 'Owner account not found.');
+      const secret = user.mfa_secret || generateTotpSecret();
+      if (!user.mfa_secret) {
+        await db.run('UPDATE users SET mfa_secret = ? WHERE id = ?', secret, owner.id);
+      }
+      const otpauthUri = `otpauth://totp/SimVault:${encodeURIComponent(user.email)}?secret=${secret}&issuer=SimVault`;
+      res.json({
+        mfa_enabled: Boolean(user.mfa_enabled),
+        secret_preview: user.mfa_enabled ? 'Configured' : secret,
+        otpauth_uri: user.mfa_enabled ? null : otpauthUri,
+      });
+    } catch (err) {
+      sendAdminError(res, err);
     }
-    const otpauthUri = `otpauth://totp/SimVault:${encodeURIComponent(user.email)}?secret=${secret}&issuer=SimVault`;
-    res.json({
-      mfa_enabled: Boolean(user.mfa_enabled),
-      secret_preview: user.mfa_enabled ? 'Configured' : secret,
-      otpauth_uri: user.mfa_enabled ? null : otpauthUri,
-    });
   });
 
-  router.post('/security/mfa/enable', (req: Request, res: Response) => {
+  router.post('/security/mfa/enable', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const { code } = req.body ?? {};
-      const user = db.prepare('SELECT mfa_secret FROM users WHERE id = ?').get(owner.id) as { mfa_secret: string | null };
+      const user = await db.get<{ mfa_secret: string | null }>('SELECT mfa_secret FROM users WHERE id = ?', owner.id);
       if (!user?.mfa_secret || !verifyTotpCode(user.mfa_secret, String(code ?? ''))) {
         throw new AppError(422, 'INVALID_TOTP', 'Verification code did not match.');
       }
-      db.prepare('UPDATE users SET mfa_enabled = 1, updated_at = ? WHERE id = ?').run(new Date().toISOString(), owner.id);
-      writeAuditLog(db, {
+      await db.run('UPDATE users SET mfa_enabled = 1, updated_at = ? WHERE id = ?', new Date().toISOString(), owner.id);
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: owner.id,
         action: 'owner.mfa_enabled',
@@ -317,102 +330,132 @@ export function createAdminRouter(db: DatabaseSync): Router {
     }
   });
 
-  router.post('/security/mfa/disable', (req: Request, res: Response) => {
-    const owner = getOwner(req);
-    db.prepare('UPDATE users SET mfa_enabled = 0, updated_at = ? WHERE id = ?').run(new Date().toISOString(), owner.id);
-    writeAuditLog(db, {
-      actorType: 'owner',
-      actorId: owner.id,
-      action: 'owner.mfa_disabled',
-      targetType: 'user',
-      targetId: owner.id,
-      ipAddress: req.ip,
-    });
-    res.json({ mfa_enabled: false });
+  router.post('/security/mfa/disable', async (req: Request, res: Response) => {
+    try {
+      const owner = getOwner(req);
+      await db.run('UPDATE users SET mfa_enabled = 0, updated_at = ? WHERE id = ?', new Date().toISOString(), owner.id);
+      await writeAuditLog(db, {
+        actorType: 'owner',
+        actorId: owner.id,
+        action: 'owner.mfa_disabled',
+        targetType: 'user',
+        targetId: owner.id,
+        ipAddress: req.ip,
+      });
+      res.json({ mfa_enabled: false });
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
   // --- Overview & Dashboard Summary ---
-  router.get('/overview', (_req: Request, res: Response) => {
-    const settings = getSettingsMap(db);
-    const dayStart = new Date();
-    dayStart.setUTCHours(0, 0, 0, 0);
-    const dayIso = dayStart.toISOString();
+  router.get('/overview', async (_req: Request, res: Response) => {
+    try {
+      await maybeRunOpportunisticSweep(db);
+      const settings = await getSettingsMap(db);
+      const dayStart = new Date();
+      dayStart.setUTCHours(0, 0, 0, 0);
+      const dayIso = dayStart.toISOString();
 
-    const statusCounts = db
-      .prepare('SELECT status, COUNT(*) as count FROM messages GROUP BY status')
-      .all() as Array<{ status: string; count: number }>;
+      const statusCounts = await db.all<{ status: string; count: number | string }>(
+        'SELECT status, COUNT(*) as count FROM messages GROUP BY status'
+      );
 
-    const todayRequests = db
-      .prepare('SELECT COUNT(*) as count FROM messages WHERE created_at >= ?')
-      .get(dayIso) as { count: number };
+      const todayRequests = await db.get<{ count: number | string }>(
+        'SELECT COUNT(*) as count FROM messages WHERE created_at >= ?',
+        dayIso
+      );
 
-    const todaySent = db
-      .prepare("SELECT COUNT(*) as count FROM messages WHERE sent_at >= ? AND status IN ('sent_to_network', 'delivered', 'delivery_unknown')")
-      .get(dayIso) as { count: number };
+      const todaySent = await db.get<{ count: number | string }>(
+        "SELECT COUNT(*) as count FROM messages WHERE sent_at >= ? AND status IN ('sent_to_network', 'delivered', 'delivery_unknown')",
+        dayIso
+      );
 
-    const queueDepth = db
-      .prepare("SELECT COUNT(*) as count FROM messages WHERE status IN ('created', 'queued', 'leased', 'accepted_by_device')")
-      .get() as { count: number };
+      const queueDepth = await db.get<{ count: number | string }>(
+        "SELECT COUNT(*) as count FROM messages WHERE status IN ('created', 'queued', 'leased', 'accepted_by_device')"
+      );
 
-    const devices = db
-      .prepare(
+      const devices = await db.all(
         `SELECT id, name, status, app_version, android_version, permission_send_sms, network_type, battery_pct, sim_ready, last_heartbeat_at
          FROM gateway_devices WHERE status != 'revoked' ORDER BY enrolled_at ASC`
-      )
-      .all();
+      );
 
-    const sims = db.prepare('SELECT * FROM sims ORDER BY updated_at DESC').all();
+      const sims = await db.all('SELECT * FROM sims ORDER BY updated_at DESC');
 
-    const recentMessages = db
-      .prepare(
+      const recentMessages = await db.all(
         `SELECT m.id, m.application_id, a.name as application_name, m.device_id, m.destination_masked, m.template_id,
                 m.purpose, m.status, m.is_test, m.created_at, m.sent_at, m.delivered_at, m.failed_at, m.error_code
          FROM messages m
          JOIN applications a ON a.id = m.application_id
          ORDER BY m.created_at DESC
          LIMIT 12`
-      )
-      .all();
+      );
 
-    const recentAudit = db
-      .prepare('SELECT id, actor_type, actor_id, action, target_type, target_id, metadata_redacted_json, ip_address, created_at FROM audit_logs ORDER BY created_at DESC LIMIT 8')
-      .all();
+      const recentAudit = await db.all(
+        'SELECT id, actor_type, actor_id, action, target_type, target_id, metadata_redacted_json, ip_address, created_at FROM audit_logs ORDER BY created_at DESC LIMIT 8'
+      );
 
-    const activeOtpCount = db
-      .prepare("SELECT COUNT(*) as count FROM otp_challenges WHERE status IN ('queued', 'sent')")
-      .get() as { count: number };
+      const activeOtpCount = await db.get<{ count: number | string }>(
+        "SELECT COUNT(*) as count FROM otp_challenges WHERE status IN ('queued', 'sent')"
+      );
 
-    res.json({
-      global_paused: settings.global_paused === 'true',
-      settings,
-      kpis: {
-        requests_today: todayRequests.count,
-        sent_to_network_today: todaySent.count,
-        queue_depth: queueDepth.count,
-        active_otps: activeOtpCount.count,
-        status_breakdown: statusCounts,
-      },
-      devices,
-      sims,
-      recent_messages: recentMessages,
-      recent_audit: recentAudit,
-    });
+      res.json({
+        global_paused: settings.global_paused === 'true',
+        settings,
+        kpis: {
+          requests_today: Number(todayRequests?.count ?? 0),
+          sent_to_network_today: Number(todaySent?.count ?? 0),
+          queue_depth: Number(queueDepth?.count ?? 0),
+          active_otps: Number(activeOtpCount?.count ?? 0),
+          status_breakdown: statusCounts.map((r) => ({ status: r.status, count: Number(r.count ?? 0) })),
+        },
+        devices,
+        sims,
+        recent_messages: recentMessages,
+        recent_audit: recentAudit,
+      });
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
   // --- Applications ---
-  router.get('/applications', (_req: Request, res: Response) => {
-    const apps = db
-      .prepare(
+  router.get('/applications', async (_req: Request, res: Response) => {
+    try {
+      const apps = await db.all<{
+        id: string;
+        owner_user_id: string;
+        name: string;
+        environment: string;
+        status: string;
+        allowed_purposes_json: string;
+        daily_limit: number | string;
+        allowlist_only: number | string;
+        created_at: string;
+        active_keys_count: number | string;
+        total_messages_count: number | string;
+      }>(
         `SELECT a.*,
                 (SELECT COUNT(*) FROM api_keys k WHERE k.application_id = a.id AND k.status != 'revoked') as active_keys_count,
                 (SELECT COUNT(*) FROM messages m WHERE m.application_id = a.id) as total_messages_count
          FROM applications a ORDER BY a.created_at DESC`
-      )
-      .all();
-    res.json({ applications: apps, valid_purposes: VALID_MESSAGE_PURPOSES });
+      );
+      res.json({
+        applications: apps.map((a) => ({
+          ...a,
+          daily_limit: Number(a.daily_limit ?? 0),
+          allowlist_only: Number(a.allowlist_only ?? 0),
+          active_keys_count: Number(a.active_keys_count ?? 0),
+          total_messages_count: Number(a.total_messages_count ?? 0),
+        })),
+        valid_purposes: VALID_MESSAGE_PURPOSES,
+      });
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
-  router.post('/applications', (req: Request, res: Response) => {
+  router.post('/applications', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const { name, environment, daily_limit, allowlist_only, allowed_purposes } = req.body ?? {};
@@ -431,10 +474,9 @@ export function createAdminRouter(db: DatabaseSync): Router {
         : [];
       const purposes = rawPurposes.length > 0 ? rawPurposes : ['login', 'mfa', 'account_transactional'];
 
-      db.prepare(
+      await db.run(
         `INSERT INTO applications (id, owner_user_id, name, environment, status, allowed_purposes_json, daily_limit, allowlist_only, created_at)
-         VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)`
-      ).run(
+         VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
         id,
         owner.id,
         String(name).trim().slice(0, 80),
@@ -445,7 +487,7 @@ export function createAdminRouter(db: DatabaseSync): Router {
         nowIso
       );
 
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: owner.id,
         action: 'application.created',
@@ -455,18 +497,18 @@ export function createAdminRouter(db: DatabaseSync): Router {
         ipAddress: req.ip,
       });
 
-      const created = db.prepare('SELECT * FROM applications WHERE id = ?').get(id);
+      const created = await db.get('SELECT * FROM applications WHERE id = ?', id);
       res.status(201).json({ application: created });
     } catch (err) {
       sendAdminError(res, err);
     }
   });
 
-  router.patch('/applications/:id', (req: Request, res: Response) => {
+  router.patch('/applications/:id', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const { status, daily_limit, allowlist_only, allowed_purposes } = req.body ?? {};
-      const existing = db.prepare('SELECT id FROM applications WHERE id = ?').get(req.params.id);
+      const existing = await db.get('SELECT id FROM applications WHERE id = ?', req.params.id);
       if (!existing) throw new AppError(404, 'NOT_FOUND', 'Application not found.');
 
       if (status !== undefined && !['active', 'paused', 'disabled'].includes(String(status))) {
@@ -479,14 +521,13 @@ export function createAdminRouter(db: DatabaseSync): Router {
         ? allowed_purposes.filter((p): p is string => typeof p === 'string' && (VALID_MESSAGE_PURPOSES as readonly string[]).includes(p))
         : null;
 
-      db.prepare(
+      await db.run(
         `UPDATE applications
          SET status = COALESCE(?, status),
              daily_limit = COALESCE(?, daily_limit),
              allowlist_only = COALESCE(?, allowlist_only),
              allowed_purposes_json = COALESCE(?, allowed_purposes_json)
-         WHERE id = ?`
-      ).run(
+         WHERE id = ?`,
         status !== undefined ? String(status) : null,
         daily_limit !== undefined ? Math.trunc(Number(daily_limit)) : null,
         typeof allowlist_only === 'boolean' ? (allowlist_only ? 1 : 0) : null,
@@ -494,7 +535,7 @@ export function createAdminRouter(db: DatabaseSync): Router {
         req.params.id
       );
 
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: owner.id,
         action: 'application.updated',
@@ -504,50 +545,61 @@ export function createAdminRouter(db: DatabaseSync): Router {
         ipAddress: req.ip,
       });
 
-      res.json({ application: db.prepare('SELECT * FROM applications WHERE id = ?').get(req.params.id) });
+      res.json({ application: await db.get('SELECT * FROM applications WHERE id = ?', req.params.id) });
     } catch (err) {
       sendAdminError(res, err);
     }
   });
 
   // --- API Keys (secret shown ONLY ONCE at creation/rotation) ---
-  router.get('/api-keys', (_req: Request, res: Response) => {
-    const keys = db
-      .prepare(
+  router.get('/api-keys', async (_req: Request, res: Response) => {
+    try {
+      const keys = await db.all(
         `SELECT k.id, k.application_id, a.name as application_name, a.environment,
                 k.name, k.key_prefix, k.scopes_json, k.status, k.last_used_at, k.expires_at, k.revoked_at, k.created_at
          FROM api_keys k
          JOIN applications a ON a.id = k.application_id
          ORDER BY k.created_at DESC`
-      )
-      .all();
-    res.json({ api_keys: keys, available_scopes: ALL_API_SCOPES });
+      );
+      res.json({ api_keys: keys, available_scopes: ALL_API_SCOPES });
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
-  router.post('/api-keys', (req: Request, res: Response) => {
+  router.post('/api-keys', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const { application_id, name, scopes } = req.body ?? {};
-      const app = db.prepare('SELECT id, environment FROM applications WHERE id = ?').get(application_id) as
-        | { id: string; environment: 'test' | 'live' }
-        | undefined;
+      const app = await db.get<{ id: string; environment: 'test' | 'live' }>(
+        'SELECT id, environment FROM applications WHERE id = ?',
+        application_id
+      );
       if (!app) throw new AppError(404, 'NOT_FOUND', 'Application not found.');
       if (!name || String(name).trim().length < 2) throw new AppError(400, 'BAD_REQUEST', 'Key label is required.');
 
-      const validScopes = Array.isArray(scopes) && scopes.length > 0
-        ? scopes.filter((s: string) => ALL_API_SCOPES.includes(s as (typeof ALL_API_SCOPES)[number]))
-        : ['sms:send', 'otp:create', 'otp:verify', 'usage:read'];
+      const validScopes =
+        Array.isArray(scopes) && scopes.length > 0
+          ? scopes.filter((s: string) => ALL_API_SCOPES.includes(s as (typeof ALL_API_SCOPES)[number]))
+          : ['sms:send', 'otp:create', 'otp:verify', 'usage:read'];
 
       const { rawKey, keyPrefix, secretHash } = generateApiKey(app.environment);
       const id = `key_${crypto.randomBytes(5).toString('hex')}`;
       const nowIso = new Date().toISOString();
 
-      db.prepare(
+      await db.run(
         `INSERT INTO api_keys (id, application_id, name, key_prefix, secret_hash, scopes_json, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`
-      ).run(id, app.id, String(name).trim(), keyPrefix, secretHash, JSON.stringify(validScopes), nowIso);
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
+        id,
+        app.id,
+        String(name).trim(),
+        keyPrefix,
+        secretHash,
+        JSON.stringify(validScopes),
+        nowIso
+      );
 
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: owner.id,
         action: 'api_key.created',
@@ -557,13 +609,12 @@ export function createAdminRouter(db: DatabaseSync): Router {
         ipAddress: req.ip,
       });
 
-      const created = db
-        .prepare(
-          `SELECT k.id, k.application_id, a.name as application_name, a.environment,
-                  k.name, k.key_prefix, k.scopes_json, k.status, k.last_used_at, k.expires_at, k.revoked_at, k.created_at
-           FROM api_keys k JOIN applications a ON a.id = k.application_id WHERE k.id = ?`
-        )
-        .get(id);
+      const created = await db.get(
+        `SELECT k.id, k.application_id, a.name as application_name, a.environment,
+                k.name, k.key_prefix, k.scopes_json, k.status, k.last_used_at, k.expires_at, k.revoked_at, k.created_at
+         FROM api_keys k JOIN applications a ON a.id = k.application_id WHERE k.id = ?`,
+        id
+      );
 
       // Returned ONLY ONCE here — never persisted or returned again
       res.status(201).json({ api_key: created, secret_once: rawKey });
@@ -572,24 +623,21 @@ export function createAdminRouter(db: DatabaseSync): Router {
     }
   });
 
-  router.post('/api-keys/:id/rotate', (req: Request, res: Response) => {
+  router.post('/api-keys/:id/rotate', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
-      const existing = db
-        .prepare(
-          `SELECT k.id, k.application_id, k.name, k.scopes_json, k.status, a.environment
-           FROM api_keys k JOIN applications a ON a.id = k.application_id WHERE k.id = ?`
-        )
-        .get(req.params.id) as
-        | {
-            id: string;
-            application_id: string;
-            name: string;
-            scopes_json: string;
-            status: string;
-            environment: 'test' | 'live';
-          }
-        | undefined;
+      const existing = await db.get<{
+        id: string;
+        application_id: string;
+        name: string;
+        scopes_json: string;
+        status: string;
+        environment: 'test' | 'live';
+      }>(
+        `SELECT k.id, k.application_id, k.name, k.scopes_json, k.status, a.environment
+         FROM api_keys k JOIN applications a ON a.id = k.application_id WHERE k.id = ?`,
+        req.params.id
+      );
 
       if (!existing || existing.status === 'revoked') {
         throw new AppError(404, 'NOT_FOUND', 'Active API key not found.');
@@ -601,20 +649,22 @@ export function createAdminRouter(db: DatabaseSync): Router {
       const { rawKey, keyPrefix, secretHash } = generateApiKey(existing.environment);
       const newId = `key_${crypto.randomBytes(5).toString('hex')}`;
 
-      db.exec('BEGIN IMMEDIATE;');
-      try {
-        db.prepare("UPDATE api_keys SET status = 'rotating', expires_at = ? WHERE id = ?").run(overlapExpires, existing.id);
-        db.prepare(
+      await db.transaction(async (tx) => {
+        await tx.run("UPDATE api_keys SET status = 'rotating', expires_at = ? WHERE id = ?", overlapExpires, existing.id);
+        await tx.run(
           `INSERT INTO api_keys (id, application_id, name, key_prefix, secret_hash, scopes_json, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`
-        ).run(newId, existing.application_id, `${existing.name} (Rotated)`, keyPrefix, secretHash, existing.scopes_json, nowIso);
-        db.exec('COMMIT;');
-      } catch (e) {
-        db.exec('ROLLBACK;');
-        throw e;
-      }
+           VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
+          newId,
+          existing.application_id,
+          `${existing.name} (Rotated)`,
+          keyPrefix,
+          secretHash,
+          existing.scopes_json,
+          nowIso
+        );
+      });
 
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: owner.id,
         action: 'api_key.rotated',
@@ -624,13 +674,12 @@ export function createAdminRouter(db: DatabaseSync): Router {
         ipAddress: req.ip,
       });
 
-      const created = db
-        .prepare(
-          `SELECT k.id, k.application_id, a.name as application_name, a.environment,
-                  k.name, k.key_prefix, k.scopes_json, k.status, k.last_used_at, k.expires_at, k.revoked_at, k.created_at
-           FROM api_keys k JOIN applications a ON a.id = k.application_id WHERE k.id = ?`
-        )
-        .get(newId);
+      const created = await db.get(
+        `SELECT k.id, k.application_id, a.name as application_name, a.environment,
+                k.name, k.key_prefix, k.scopes_json, k.status, k.last_used_at, k.expires_at, k.revoked_at, k.created_at
+         FROM api_keys k JOIN applications a ON a.id = k.application_id WHERE k.id = ?`,
+        newId
+      );
 
       res.status(201).json({ api_key: created, secret_once: rawKey, overlap_expires_at: overlapExpires });
     } catch (err) {
@@ -638,16 +687,18 @@ export function createAdminRouter(db: DatabaseSync): Router {
     }
   });
 
-  router.post('/api-keys/:id/revoke', (req: Request, res: Response) => {
+  router.post('/api-keys/:id/revoke', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const nowIso = new Date().toISOString();
-      const result = db
-        .prepare("UPDATE api_keys SET status = 'revoked', revoked_at = ? WHERE id = ? AND status != 'revoked'")
-        .run(nowIso, req.params.id);
+      const result = await db.run(
+        "UPDATE api_keys SET status = 'revoked', revoked_at = ? WHERE id = ? AND status != 'revoked'",
+        nowIso,
+        req.params.id
+      );
       if (result.changes === 0) throw new AppError(404, 'NOT_FOUND', 'API key not found or already revoked.');
 
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: owner.id,
         action: 'api_key.revoked',
@@ -662,47 +713,51 @@ export function createAdminRouter(db: DatabaseSync): Router {
   });
 
   // --- Messages & Test Dispatch ---
-  router.get('/messages', (req: Request, res: Response) => {
-    const status = typeof req.query.status === 'string' && req.query.status !== 'all' ? req.query.status : null;
-    const appId = typeof req.query.application_id === 'string' && req.query.application_id !== 'all' ? req.query.application_id : null;
-    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  router.get('/messages', async (req: Request, res: Response) => {
+    try {
+      const status = typeof req.query.status === 'string' && req.query.status !== 'all' ? req.query.status : null;
+      const appId = typeof req.query.application_id === 'string' && req.query.application_id !== 'all' ? req.query.application_id : null;
+      const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
 
-    let sql = `
-      SELECT m.id, m.application_id, a.name as application_name, a.environment, m.device_id,
-             m.destination_masked, m.template_id, m.purpose, m.status, m.is_test, m.idempotency_key,
-             m.ttl_expires_at, m.created_at, m.queued_at, m.leased_at, m.accepted_at,
-             m.sent_at, m.delivered_at, m.failed_at, m.error_code
-      FROM messages m
-      JOIN applications a ON a.id = m.application_id
-      WHERE 1=1
-    `;
-    const params: string[] = [];
-    if (status) {
-      sql += ' AND m.status = ?';
-      params.push(status);
-    }
-    if (appId) {
-      sql += ' AND m.application_id = ?';
-      params.push(appId);
-    }
-    if (q) {
-      sql += ' AND (m.id LIKE ? OR m.destination_masked LIKE ? OR m.template_id LIKE ?)';
-      params.push(`%${q}%`, `%${q}%`, `%${q}%`);
-    }
-    sql += ' ORDER BY m.created_at DESC LIMIT 100';
+      let sql = `
+        SELECT m.id, m.application_id, a.name as application_name, a.environment, m.device_id,
+               m.destination_masked, m.template_id, m.purpose, m.status, m.is_test, m.idempotency_key,
+               m.ttl_expires_at, m.created_at, m.queued_at, m.leased_at, m.accepted_at,
+               m.sent_at, m.delivered_at, m.failed_at, m.error_code
+        FROM messages m
+        JOIN applications a ON a.id = m.application_id
+        WHERE 1=1
+      `;
+      const params: string[] = [];
+      if (status) {
+        sql += ' AND m.status = ?';
+        params.push(status);
+      }
+      if (appId) {
+        sql += ' AND m.application_id = ?';
+        params.push(appId);
+      }
+      if (q) {
+        sql += ' AND (LOWER(m.id) LIKE LOWER(?) OR LOWER(m.destination_masked) LIKE LOWER(?) OR LOWER(m.template_id) LIKE LOWER(?))';
+        params.push(`%${q}%`, `%${q}%`, `%${q}%`);
+      }
+      sql += ' ORDER BY m.created_at DESC LIMIT 100';
 
-    const rows = db.prepare(sql).all(...params);
-    res.json({ messages: rows });
+      const rows = await db.all(sql, ...params);
+      res.json({ messages: rows });
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
-  const handleAdminSendSms = (req: Request, res: Response) => {
+  const handleAdminSendSms = async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const { application_id, to, template_id, variables, purpose, ttl_seconds, idempotency_key } = req.body ?? {};
       if (!application_id || !to || !template_id) {
         throw new AppError(400, 'BAD_REQUEST', 'application_id, to, and template_id are required.');
       }
-      const result = createSmsRequest(db, {
+      const result = await createSmsRequest(db, {
         applicationId: String(application_id),
         to: String(to),
         templateCode: String(template_id),
@@ -723,9 +778,9 @@ export function createAdminRouter(db: DatabaseSync): Router {
   router.post('/messages/test-send', handleAdminSendSms);
 
   // --- OTP Challenges ---
-  router.get('/otp-challenges', (_req: Request, res: Response) => {
-    const challenges = db
-      .prepare(
+  router.get('/otp-challenges', async (_req: Request, res: Response) => {
+    try {
+      const challenges = await db.all(
         `SELECT o.id, o.application_id, a.name as application_name, o.destination_masked,
                 o.purpose, o.status, o.is_test, o.expires_at, o.attempts, o.max_attempts,
                 o.consumed_at, o.message_id, o.created_at
@@ -733,19 +788,21 @@ export function createAdminRouter(db: DatabaseSync): Router {
          JOIN applications a ON a.id = o.application_id
          ORDER BY o.created_at DESC
          LIMIT 100`
-      )
-      .all();
-    res.json({ challenges });
+      );
+      res.json({ challenges });
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
-  const handleAdminCreateOtp = (req: Request, res: Response) => {
+  const handleAdminCreateOtp = async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const { application_id, to, purpose, ttl_seconds, bypass_cooldown } = req.body ?? {};
       if (!application_id || !to) {
         throw new AppError(400, 'BAD_REQUEST', 'application_id and to are required.');
       }
-      const result = createOtpChallenge(db, {
+      const result = await createOtpChallenge(db, {
         applicationId: String(application_id),
         to: String(to),
         purpose: String(purpose || 'login'),
@@ -763,10 +820,10 @@ export function createAdminRouter(db: DatabaseSync): Router {
   router.post('/otp-challenges/create', handleAdminCreateOtp);
   router.post('/otp-challenges/test-create', handleAdminCreateOtp);
 
-  const handleAdminVerifyOtp = (req: Request, res: Response) => {
+  const handleAdminVerifyOtp = async (req: Request, res: Response) => {
     try {
       const { challenge_id, code } = req.body ?? {};
-      const result = verifyOtpChallenge(db, {
+      const result = await verifyOtpChallenge(db, {
         challengeId: String(challenge_id ?? ''),
         code: String(code ?? ''),
         ipAddress: req.ip,
@@ -781,30 +838,38 @@ export function createAdminRouter(db: DatabaseSync): Router {
   router.post('/otp-challenges/test-verify', handleAdminVerifyOtp);
 
   // --- Gateway Devices (Live Hardware Control Only) ---
-  router.get('/devices', (_req: Request, res: Response) => {
-    const devices = db
-      .prepare('SELECT id, name, status, app_version, android_version, permission_send_sms, network_type, battery_pct, sim_ready, last_heartbeat_at, enrolled_at, revoked_at FROM gateway_devices ORDER BY enrolled_at DESC')
-      .all();
-    const tokens = db
-      .prepare('SELECT id, device_name, expires_at, used_at, created_at FROM enrollment_tokens ORDER BY created_at DESC LIMIT 10')
-      .all();
-    const sims = db.prepare('SELECT * FROM sims').all();
-    const queuedCount = (db.prepare("SELECT COUNT(*) as c FROM messages WHERE status = 'queued'").get() as { c: number }).c;
-    const leasedJobs = db
-      .prepare(
+  router.get('/devices', async (_req: Request, res: Response) => {
+    try {
+      const devices = await db.all(
+        'SELECT id, name, status, app_version, android_version, permission_send_sms, network_type, battery_pct, sim_ready, last_heartbeat_at, enrolled_at, revoked_at FROM gateway_devices ORDER BY enrolled_at DESC'
+      );
+      const tokens = await db.all(
+        'SELECT id, device_name, expires_at, used_at, created_at FROM enrollment_tokens ORDER BY created_at DESC LIMIT 10'
+      );
+      const sims = await db.all('SELECT * FROM sims');
+      const queuedRow = await db.get<{ c: number | string }>("SELECT COUNT(*) as c FROM messages WHERE status = 'queued'");
+      const leasedJobs = await db.all(
         `SELECT m.id, m.destination_masked, m.template_id, m.purpose, m.status, m.is_test, m.leased_at, m.ttl_expires_at, l.lease_expires_at, l.attempt_count
          FROM messages m
          LEFT JOIN gateway_job_leases l ON l.message_id = m.id
          WHERE m.status IN ('queued', 'leased', 'accepted_by_device')
          ORDER BY m.created_at ASC
          LIMIT 20`
-      )
-      .all();
+      );
 
-    res.json({ devices, enrollment_tokens: tokens, sims, queued_count: queuedCount, pending_jobs: leasedJobs });
+      res.json({
+        devices,
+        enrollment_tokens: tokens,
+        sims,
+        queued_count: Number(queuedRow?.c ?? 0),
+        pending_jobs: leasedJobs,
+      });
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
-  router.post('/devices/enrollment-tokens', (req: Request, res: Response) => {
+  router.post('/devices/enrollment-tokens', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const { device_name, ttl_minutes } = req.body ?? {};
@@ -818,12 +883,17 @@ export function createAdminRouter(db: DatabaseSync): Router {
       const expiresAt = new Date(now.getTime() + boundedTtl * 60_000).toISOString();
       const id = `enr_${crypto.randomBytes(4).toString('hex')}`;
 
-      db.prepare(
+      await db.run(
         `INSERT INTO enrollment_tokens (id, device_name, token_hash, expires_at, created_at)
-         VALUES (?, ?, ?, ?, ?)`
-      ).run(id, String(device_name).trim().slice(0, 80), tokenHash, expiresAt, now.toISOString());
+         VALUES (?, ?, ?, ?, ?)`,
+        id,
+        String(device_name).trim().slice(0, 80),
+        tokenHash,
+        expiresAt,
+        now.toISOString()
+      );
 
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: owner.id,
         action: 'gateway.enrollment_token_created',
@@ -833,32 +903,40 @@ export function createAdminRouter(db: DatabaseSync): Router {
         ipAddress: req.ip,
       });
 
-      res.status(201).json({ id, device_name: String(device_name).trim(), enrollment_token_once: rawToken, expires_at: expiresAt });
+      res.status(201).json({
+        id,
+        device_name: String(device_name).trim(),
+        enrollment_token_once: rawToken,
+        expires_at: expiresAt,
+      });
     } catch (err) {
       sendAdminError(res, err);
     }
   });
 
-  router.post('/devices/:id/action', (req: Request, res: Response) => {
+  router.post('/devices/:id/action', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const { action } = req.body ?? {};
       const devId = req.params.id;
-      const dev = db.prepare('SELECT id, status FROM gateway_devices WHERE id = ?').get(devId) as { id: string; status: string } | undefined;
+      const dev = await db.get<{ id: string; status: string }>('SELECT id, status FROM gateway_devices WHERE id = ?', devId);
       if (!dev) throw new AppError(404, 'NOT_FOUND', 'Device not found.');
 
       const nowIso = new Date().toISOString();
       if (action === 'pause') {
-        db.prepare("UPDATE gateway_devices SET status = 'paused' WHERE id = ? AND status != 'revoked'").run(devId);
+        await db.run("UPDATE gateway_devices SET status = 'paused' WHERE id = ? AND status != 'revoked'", devId);
       } else if (action === 'resume') {
-        db.prepare("UPDATE gateway_devices SET status = CASE WHEN last_heartbeat_at IS NOT NULL THEN 'online' ELSE 'offline' END WHERE id = ? AND status != 'revoked'").run(devId);
+        await db.run(
+          "UPDATE gateway_devices SET status = CASE WHEN last_heartbeat_at IS NOT NULL THEN 'online' ELSE 'offline' END WHERE id = ? AND status != 'revoked'",
+          devId
+        );
       } else if (action === 'revoke') {
-        db.prepare("UPDATE gateway_devices SET status = 'revoked', revoked_at = ? WHERE id = ?").run(nowIso, devId);
+        await db.run("UPDATE gateway_devices SET status = 'revoked', revoked_at = ? WHERE id = ?", nowIso, devId);
       } else {
         throw new AppError(400, 'BAD_REQUEST', 'Unsupported device action. Allowed: pause, resume, revoke.');
       }
 
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: owner.id,
         action: `gateway.device_${action}`,
@@ -867,23 +945,31 @@ export function createAdminRouter(db: DatabaseSync): Router {
         ipAddress: req.ip,
       });
 
-      res.json({ device: db.prepare('SELECT * FROM gateway_devices WHERE id = ?').get(devId) });
+      res.json({ device: await db.get('SELECT * FROM gateway_devices WHERE id = ?', devId) });
     } catch (err) {
       sendAdminError(res, err);
     }
   });
 
   // --- SIM & Usage ---
-  router.get('/sim-usage', (_req: Request, res: Response) => {
-    const sims = db
-      .prepare(
+  router.get('/sim-usage', async (_req: Request, res: Response) => {
+    try {
+      const sims = await db.all(
         `SELECT s.*, d.name as device_name, d.status as device_status
          FROM sims s JOIN gateway_devices d ON d.id = s.device_id`
-      )
-      .all();
+      );
 
-    const usageByApp = db
-      .prepare(
+      const usageByApp = await db.all<{
+        application_id: string;
+        application_name: string;
+        environment: string;
+        daily_limit: number | string;
+        total_messages: number | string;
+        sent_to_network: number | string | null;
+        delivered: number | string | null;
+        failed: number | string | null;
+        delivery_unknown: number | string | null;
+      }>(
         `SELECT a.id as application_id, a.name as application_name, a.environment, a.daily_limit,
                 COUNT(m.id) as total_messages,
                 SUM(CASE WHEN m.status = 'sent_to_network' THEN 1 ELSE 0 END) as sent_to_network,
@@ -892,28 +978,42 @@ export function createAdminRouter(db: DatabaseSync): Router {
                 SUM(CASE WHEN m.status = 'delivery_unknown' THEN 1 ELSE 0 END) as delivery_unknown
          FROM applications a
          LEFT JOIN messages m ON m.application_id = a.id
-         GROUP BY a.id`
-      )
-      .all();
+         GROUP BY a.id, a.name, a.environment, a.daily_limit`
+      );
 
-    res.json({ sims, usage_by_app: usageByApp });
+      res.json({
+        sims,
+        usage_by_app: usageByApp.map((r) => ({
+          ...r,
+          daily_limit: Number(r.daily_limit ?? 0),
+          total_messages: Number(r.total_messages ?? 0),
+          sent_to_network: Number(r.sent_to_network ?? 0),
+          delivered: Number(r.delivered ?? 0),
+          failed: Number(r.failed ?? 0),
+          delivery_unknown: Number(r.delivery_unknown ?? 0),
+        })),
+      });
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
-  router.patch('/sim-usage/:id/reconcile', (req: Request, res: Response) => {
+  router.patch('/sim-usage/:id/reconcile', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const { plan_sms_limit, estimated_sms_sent, warning_threshold, carrier_label, period_start, period_end, notes } = req.body ?? {};
-      const sim = db.prepare('SELECT * FROM sims WHERE id = ?').get(req.params.id) as
-        | { id: string; plan_sms_limit: number; estimated_sms_sent: number }
-        | undefined;
+      const sim = await db.get<{ id: string; plan_sms_limit: number; estimated_sms_sent: number }>(
+        'SELECT * FROM sims WHERE id = ?',
+        req.params.id
+      );
       if (!sim) throw new AppError(404, 'NOT_FOUND', 'SIM record not found.');
 
-      const nextLimit = typeof plan_sms_limit === 'number' ? Math.max(0, plan_sms_limit) : sim.plan_sms_limit;
-      const nextSent = typeof estimated_sms_sent === 'number' ? Math.max(0, estimated_sms_sent) : sim.estimated_sms_sent;
+      const nextLimit = typeof plan_sms_limit === 'number' ? Math.max(0, plan_sms_limit) : Number(sim.plan_sms_limit);
+      const nextSent = typeof estimated_sms_sent === 'number' ? Math.max(0, estimated_sms_sent) : Number(sim.estimated_sms_sent);
       const { remaining } = calculateSimRemainingEstimate(nextLimit, nextSent);
       const nowIso = new Date().toISOString();
 
-      db.prepare(
+      await db.run(
         `UPDATE sims
          SET plan_sms_limit = ?,
              estimated_sms_sent = ?,
@@ -924,8 +1024,7 @@ export function createAdminRouter(db: DatabaseSync): Router {
              period_end = COALESCE(?, period_end),
              notes = COALESCE(?, notes),
              updated_at = ?
-         WHERE id = ?`
-      ).run(
+         WHERE id = ?`,
         nextLimit,
         nextSent,
         remaining,
@@ -938,7 +1037,7 @@ export function createAdminRouter(db: DatabaseSync): Router {
         req.params.id
       );
 
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: owner.id,
         action: 'sim.manual_reconciliation',
@@ -948,19 +1047,23 @@ export function createAdminRouter(db: DatabaseSync): Router {
         ipAddress: req.ip,
       });
 
-      res.json({ sim: db.prepare('SELECT * FROM sims WHERE id = ?').get(req.params.id) });
+      res.json({ sim: await db.get('SELECT * FROM sims WHERE id = ?', req.params.id) });
     } catch (err) {
       sendAdminError(res, err);
     }
   });
 
   // --- Templates ---
-  router.get('/templates', (_req: Request, res: Response) => {
-    const templates = db.prepare('SELECT * FROM message_templates ORDER BY created_at DESC').all();
-    res.json({ templates, valid_purposes: VALID_MESSAGE_PURPOSES });
+  router.get('/templates', async (_req: Request, res: Response) => {
+    try {
+      const templates = await db.all('SELECT * FROM message_templates ORDER BY created_at DESC');
+      res.json({ templates, valid_purposes: VALID_MESSAGE_PURPOSES });
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
-  router.post('/templates', (req: Request, res: Response) => {
+  router.post('/templates', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const { code, purpose, body, status } = req.body ?? {};
@@ -974,12 +1077,20 @@ export function createAdminRouter(db: DatabaseSync): Router {
       }
       const id = `tpl_${crypto.randomBytes(5).toString('hex')}`;
       const nowIso = new Date().toISOString();
-      db.prepare(
+      await db.run(
         `INSERT INTO message_templates (id, owner_user_id, code, purpose, body, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(id, owner.id, cleanCode, cleanPurpose, String(body).trim(), status === 'draft' ? 'draft' : 'approved', nowIso, nowIso);
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        id,
+        owner.id,
+        cleanCode,
+        cleanPurpose,
+        String(body).trim(),
+        status === 'draft' ? 'draft' : 'approved',
+        nowIso,
+        nowIso
+      );
 
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: owner.id,
         action: 'template.created',
@@ -988,13 +1099,13 @@ export function createAdminRouter(db: DatabaseSync): Router {
         metadata: { code: cleanCode, purpose: cleanPurpose },
         ipAddress: req.ip,
       });
-      res.status(201).json({ template: db.prepare('SELECT * FROM message_templates WHERE id = ?').get(id) });
+      res.status(201).json({ template: await db.get('SELECT * FROM message_templates WHERE id = ?', id) });
     } catch (err) {
       sendAdminError(res, err);
     }
   });
 
-  router.patch('/templates/:id', (req: Request, res: Response) => {
+  router.patch('/templates/:id', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const { body, status, purpose } = req.body ?? {};
@@ -1005,19 +1116,22 @@ export function createAdminRouter(db: DatabaseSync): Router {
         throw new AppError(422, 'INVALID_PURPOSE', 'Invalid message purpose.');
       }
       const nowIso = new Date().toISOString();
-      const result = db
-        .prepare(
-          `UPDATE message_templates
-           SET body = COALESCE(?, body),
-               status = COALESCE(?, status),
-               purpose = COALESCE(?, purpose),
-               updated_at = ?
-           WHERE id = ?`
-        )
-        .run(body ?? null, status ?? null, purpose ?? null, nowIso, req.params.id);
+      const result = await db.run(
+        `UPDATE message_templates
+         SET body = COALESCE(?, body),
+             status = COALESCE(?, status),
+             purpose = COALESCE(?, purpose),
+             updated_at = ?
+         WHERE id = ?`,
+        body ?? null,
+        status ?? null,
+        purpose ?? null,
+        nowIso,
+        req.params.id
+      );
 
       if (result.changes === 0) throw new AppError(404, 'NOT_FOUND', 'Template not found.');
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: owner.id,
         action: 'template.updated',
@@ -1026,29 +1140,31 @@ export function createAdminRouter(db: DatabaseSync): Router {
         metadata: { status, purpose },
         ipAddress: req.ip,
       });
-      res.json({ template: db.prepare('SELECT * FROM message_templates WHERE id = ?').get(req.params.id) });
+      res.json({ template: await db.get('SELECT * FROM message_templates WHERE id = ?', req.params.id) });
     } catch (err) {
       sendAdminError(res, err);
     }
   });
 
   // --- Destination Allowlist ---
-  router.get('/allowlist', (_req: Request, res: Response) => {
-    const entries = db
-      .prepare(
+  router.get('/allowlist', async (_req: Request, res: Response) => {
+    try {
+      const entries = await db.all(
         `SELECT d.id, d.application_id, a.name as application_name, d.e164_masked, d.label, d.created_at
          FROM destination_allowlist d JOIN applications a ON a.id = d.application_id
          ORDER BY d.created_at DESC`
-      )
-      .all();
-    res.json({ entries });
+      );
+      res.json({ entries });
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
-  router.post('/allowlist', (req: Request, res: Response) => {
+  router.post('/allowlist', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const { application_id, phone, label } = req.body ?? {};
-      const appExists = db.prepare('SELECT id FROM applications WHERE id = ?').get(String(application_id ?? ''));
+      const appExists = await db.get('SELECT id FROM applications WHERE id = ?', String(application_id ?? ''));
       if (!appExists) {
         throw new AppError(404, 'APPLICATION_NOT_FOUND', 'Application not found.');
       }
@@ -1059,12 +1175,19 @@ export function createAdminRouter(db: DatabaseSync): Router {
       const id = crypto.randomUUID();
       const masked = maskE164(normalized);
       const nowIso = new Date().toISOString();
-      db.prepare(
+      await db.run(
         `INSERT INTO destination_allowlist (id, application_id, e164_masked, e164_hash, e164_encrypted, label, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(id, String(application_id), masked, hashDestination(normalized), encryptField(normalized), String(label || 'Approved Destination').slice(0, 80), nowIso);
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        id,
+        String(application_id),
+        masked,
+        hashDestination(normalized),
+        encryptField(normalized),
+        String(label || 'Approved Destination').slice(0, 80),
+        nowIso
+      );
 
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: owner.id,
         action: 'allowlist.added',
@@ -1079,44 +1202,48 @@ export function createAdminRouter(db: DatabaseSync): Router {
     }
   });
 
-  router.delete('/allowlist/:id', (req: Request, res: Response) => {
-    const owner = getOwner(req);
-    db.prepare('DELETE FROM destination_allowlist WHERE id = ?').run(req.params.id);
-    writeAuditLog(db, {
-      actorType: 'owner',
-      actorId: owner.id,
-      action: 'allowlist.removed',
-      targetType: 'destination_allowlist',
-      targetId: req.params.id,
-      ipAddress: req.ip,
-    });
-    res.json({ deleted: true });
+  router.delete('/allowlist/:id', async (req: Request, res: Response) => {
+    try {
+      const owner = getOwner(req);
+      await db.run('DELETE FROM destination_allowlist WHERE id = ?', req.params.id);
+      await writeAuditLog(db, {
+        actorType: 'owner',
+        actorId: owner.id,
+        action: 'allowlist.removed',
+        targetType: 'destination_allowlist',
+        targetId: req.params.id,
+        ipAddress: req.ip,
+      });
+      res.json({ deleted: true });
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
   // --- Webhooks (SSRF-hardened HTTPS endpoints only) ---
-  router.get('/webhooks', (_req: Request, res: Response) => {
-    const endpoints = db
-      .prepare(
+  router.get('/webhooks', async (_req: Request, res: Response) => {
+    try {
+      const endpoints = await db.all(
         `SELECT w.id, w.application_id, a.name as application_name, w.url, w.enabled, w.event_types_json, w.created_at
          FROM webhook_endpoints w JOIN applications a ON a.id = w.application_id
          ORDER BY w.created_at DESC`
-      )
-      .all();
-    const deliveries = db
-      .prepare(
+      );
+      const deliveries = await db.all(
         `SELECT d.*, e.url
          FROM webhook_deliveries d JOIN webhook_endpoints e ON e.id = d.endpoint_id
          ORDER BY d.created_at DESC LIMIT 40`
-      )
-      .all();
-    res.json({ endpoints, deliveries });
+      );
+      res.json({ endpoints, deliveries });
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
   router.post('/webhooks', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const { application_id, url, event_types } = req.body ?? {};
-      const appExists = db.prepare('SELECT id FROM applications WHERE id = ?').get(String(application_id ?? ''));
+      const appExists = await db.get('SELECT id FROM applications WHERE id = ?', String(application_id ?? ''));
       if (!appExists) {
         throw new AppError(404, 'APPLICATION_NOT_FOUND', 'Application not found.');
       }
@@ -1133,12 +1260,18 @@ export function createAdminRouter(db: DatabaseSync): Router {
           : ['message.status', 'otp.sent', 'otp.verified', 'otp.failed'];
       const nowIso = new Date().toISOString();
 
-      db.prepare(
+      await db.run(
         `INSERT INTO webhook_endpoints (id, application_id, url, secret_encrypted, enabled, event_types_json, created_at)
-         VALUES (?, ?, ?, ?, 1, ?, ?)`
-      ).run(id, String(application_id), cleanUrl, encryptField(rawSecret), JSON.stringify(events), nowIso);
+         VALUES (?, ?, ?, ?, 1, ?, ?)`,
+        id,
+        String(application_id),
+        cleanUrl,
+        encryptField(rawSecret),
+        JSON.stringify(events),
+        nowIso
+      );
 
-      writeAuditLog(db, {
+      await writeAuditLog(db, {
         actorType: 'owner',
         actorId: owner.id,
         action: 'webhook.created',
@@ -1157,59 +1290,78 @@ export function createAdminRouter(db: DatabaseSync): Router {
     }
   });
 
-  router.post('/webhooks/:id/test', (req: Request, res: Response) => {
+  router.post('/webhooks/:id/test', async (req: Request, res: Response) => {
     try {
-      const ep = db.prepare('SELECT id, application_id, url, secret_encrypted FROM webhook_endpoints WHERE id = ?').get(req.params.id) as
-        | { id: string; application_id: string; url: string; secret_encrypted: string }
-        | undefined;
+      const ep = await db.get<{ id: string; application_id: string; url: string; secret_encrypted: string }>(
+        'SELECT id, application_id, url, secret_encrypted FROM webhook_endpoints WHERE id = ?',
+        req.params.id
+      );
       if (!ep) throw new AppError(404, 'NOT_FOUND', 'Webhook endpoint not found.');
       const eventId = `evt_test_${crypto.randomBytes(4).toString('hex')}`;
       const nowIso = new Date().toISOString();
       const payload = JSON.stringify({ event_id: eventId, event_type: 'message.status', test: true, occurred_at: nowIso });
-      db.prepare(
+      await db.run(
         `INSERT INTO webhook_deliveries (id, endpoint_id, event_id, event_type, payload_redacted_json, status, attempt_count, next_attempt_at, last_http_status, created_at)
-         VALUES (?, ?, ?, 'message.status', ?, 'pending', 0, ?, NULL, ?)`
-      ).run(crypto.randomUUID(), ep.id, eventId, payload, nowIso, nowIso);
-      const tick = runSweeperTick(db);
+         VALUES (?, ?, ?, 'message.status', ?, 'pending', 0, ?, NULL, ?)`,
+        crypto.randomUUID(),
+        ep.id,
+        eventId,
+        payload,
+        nowIso,
+        nowIso
+      );
+      const tick = await runSweeperTick(db);
       res.json({ queued: true, event_id: eventId, sweeper: tick });
     } catch (err) {
       sendAdminError(res, err);
     }
   });
 
-  router.patch('/webhooks/:id/toggle', (req: Request, res: Response) => {
-    const owner = getOwner(req);
-    db.prepare('UPDATE webhook_endpoints SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END WHERE id = ?').run(req.params.id);
-    writeAuditLog(db, {
-      actorType: 'owner',
-      actorId: owner.id,
-      action: 'webhook.toggled',
-      targetType: 'webhook_endpoint',
-      targetId: req.params.id,
-      ipAddress: req.ip,
-    });
-    res.json({ ok: true });
+  router.patch('/webhooks/:id/toggle', async (req: Request, res: Response) => {
+    try {
+      const owner = getOwner(req);
+      await db.run('UPDATE webhook_endpoints SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END WHERE id = ?', req.params.id);
+      await writeAuditLog(db, {
+        actorType: 'owner',
+        actorId: owner.id,
+        action: 'webhook.toggled',
+        targetType: 'webhook_endpoint',
+        targetId: req.params.id,
+        ipAddress: req.ip,
+      });
+      res.json({ ok: true });
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
   // --- Audit Logs ---
-  router.get('/audit-logs', (req: Request, res: Response) => {
-    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
-    let sql = 'SELECT * FROM audit_logs WHERE 1=1';
-    const params: string[] = [];
-    if (q) {
-      sql += ' AND (action LIKE ? OR target_type LIKE ? OR target_id LIKE ? OR metadata_redacted_json LIKE ?)';
-      params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+  router.get('/audit-logs', async (req: Request, res: Response) => {
+    try {
+      const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+      let sql = 'SELECT * FROM audit_logs WHERE 1=1';
+      const params: string[] = [];
+      if (q) {
+        sql += ' AND (LOWER(action) LIKE LOWER(?) OR LOWER(target_type) LIKE LOWER(?) OR LOWER(target_id) LIKE LOWER(?) OR LOWER(metadata_redacted_json) LIKE LOWER(?))';
+        params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+      }
+      sql += ' ORDER BY created_at DESC LIMIT 120';
+      res.json({ logs: await db.all(sql, ...params) });
+    } catch (err) {
+      sendAdminError(res, err);
     }
-    sql += ' ORDER BY created_at DESC LIMIT 120';
-    res.json({ logs: db.prepare(sql).all(...params) });
   });
 
   // --- Settings & Kill Switch ---
-  router.get('/settings', (_req: Request, res: Response) => {
-    res.json({ settings: getSettingsMap(db) });
+  router.get('/settings', async (_req: Request, res: Response) => {
+    try {
+      res.json({ settings: await getSettingsMap(db) });
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
-  router.patch('/settings', (req: Request, res: Response) => {
+  router.patch('/settings', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
       const updates = req.body ?? {};
@@ -1228,24 +1380,28 @@ export function createAdminRouter(db: DatabaseSync): Router {
       for (const [k, v] of Object.entries(updates)) {
         if (k === 'global_paused') {
           const val = String(v) === 'true' ? 'true' : 'false';
-          updateSetting(db, k, val, owner.id, req.ip);
+          await updateSetting(db, k, val, owner.id, req.ip);
         } else if (k in numericBounds) {
           const num = Number(v);
           const [min, max] = numericBounds[k];
           if (!Number.isFinite(num) || num < min || num > max) {
             throw new AppError(422, 'INVALID_SETTING', `Setting ${k} must be between ${min} and ${max}.`);
           }
-          updateSetting(db, k, String(Math.trunc(num)), owner.id, req.ip);
+          await updateSetting(db, k, String(Math.trunc(num)), owner.id, req.ip);
         }
       }
-      res.json({ settings: getSettingsMap(db) });
+      res.json({ settings: await getSettingsMap(db) });
     } catch (err) {
       sendAdminError(res, err);
     }
   });
 
-  router.post('/sweeper/run', (_req: Request, res: Response) => {
-    res.json(runSweeperTick(db));
+  router.post('/sweeper/run', async (_req: Request, res: Response) => {
+    try {
+      res.json(await runSweeperTick(db));
+    } catch (err) {
+      sendAdminError(res, err);
+    }
   });
 
   // --- Deployment & Android Gateway Blueprint Snippets (matching Docs 05 & 09) ---
@@ -1345,11 +1501,11 @@ sudo journalctl -u simvault -f`,
 
       const localHeader = Buffer.alloc(30);
       localHeader.writeUInt32LE(0x04034b50, 0);
-      localHeader.writeUInt16LE(20, 4); // version needed
-      localHeader.writeUInt16LE(0x0800, 6); // UTF-8 filename flag
-      localHeader.writeUInt16LE(0, 8); // compression method: STORE
-      localHeader.writeUInt16LE(0, 10); // mod time
-      localHeader.writeUInt16LE(0x5421, 12); // mod date
+      localHeader.writeUInt16LE(20, 4);
+      localHeader.writeUInt16LE(0x0800, 6);
+      localHeader.writeUInt16LE(0, 8);
+      localHeader.writeUInt16LE(0, 10);
+      localHeader.writeUInt16LE(0x5421, 12);
       localHeader.writeUInt32LE(crc, 14);
       localHeader.writeUInt32LE(size, 18);
       localHeader.writeUInt32LE(size, 22);

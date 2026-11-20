@@ -4,7 +4,13 @@ import express from 'express';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { createIsolatedTestDb, resolveDbPath, syncEnvAdminCredentials } from '../server/db';
+import {
+  convertPlaceholdersToPostgres,
+  createIsolatedTestDb,
+  DbClient,
+  resolveDbPath,
+  syncEnvAdminCredentials,
+} from '../server/db';
 import { decryptField, generateApiKey, hashApiKey, hashOtpCode, verifyPassword } from '../server/crypto';
 import { createAdminRouter } from '../server/routes/admin';
 import { createV1Router } from '../server/routes/v1';
@@ -21,7 +27,7 @@ import {
   verifyOtpChallenge,
 } from '../server/services';
 
-async function withServer(db: ReturnType<typeof createIsolatedTestDb>, fn: (baseUrl: string) => Promise<void>) {
+async function withServer(db: DbClient, fn: (baseUrl: string) => Promise<void>) {
   const app = express();
   app.use(express.json({ limit: '64kb' }));
   app.use('/v1', createV1Router(db));
@@ -36,13 +42,13 @@ async function withServer(db: ReturnType<typeof createIsolatedTestDb>, fn: (base
   }
 }
 
-test('Live mode fresh DB starts clean with zero demo devices, messages, OTPs, or keys', () => {
-  const db = createIsolatedTestDb();
-  const deviceCount = (db.prepare('SELECT COUNT(*) as c FROM gateway_devices').get() as { c: number }).c;
-  const msgCount = (db.prepare('SELECT COUNT(*) as c FROM messages').get() as { c: number }).c;
-  const otpCount = (db.prepare('SELECT COUNT(*) as c FROM otp_challenges').get() as { c: number }).c;
-  const keyCount = (db.prepare('SELECT COUNT(*) as c FROM api_keys').get() as { c: number }).c;
-  const whCount = (db.prepare('SELECT COUNT(*) as c FROM webhook_endpoints').get() as { c: number }).c;
+test('Live mode fresh DB starts clean with zero demo devices, messages, OTPs, or keys', async () => {
+  const db = await createIsolatedTestDb();
+  const deviceCount = Number((await db.get<{ c: number }>('SELECT COUNT(*) as c FROM gateway_devices'))?.c ?? 0);
+  const msgCount = Number((await db.get<{ c: number }>('SELECT COUNT(*) as c FROM messages'))?.c ?? 0);
+  const otpCount = Number((await db.get<{ c: number }>('SELECT COUNT(*) as c FROM otp_challenges'))?.c ?? 0);
+  const keyCount = Number((await db.get<{ c: number }>('SELECT COUNT(*) as c FROM api_keys'))?.c ?? 0);
+  const whCount = Number((await db.get<{ c: number }>('SELECT COUNT(*) as c FROM webhook_endpoints'))?.c ?? 0);
 
   assert.equal(deviceCount, 0);
   assert.equal(msgCount, 0);
@@ -51,30 +57,34 @@ test('Live mode fresh DB starts clean with zero demo devices, messages, OTPs, or
   assert.equal(whCount, 0);
 });
 
-test('API key creation, authentication, and revocation work on live app', () => {
-  const db = createIsolatedTestDb();
+test('API key creation, authentication, and revocation work on live app', async () => {
+  const db = await createIsolatedTestDb();
   const { rawKey, keyPrefix, secretHash } = generateApiKey('live');
 
-  db.prepare(
+  await db.run(
     `INSERT INTO api_keys (id, application_id, name, key_prefix, secret_hash, scopes_json, status, created_at)
-     VALUES (?, 'app_portal_prod', 'Live Key', ?, ?, '["sms:send","otp:create","otp:verify"]', 'active', ?)`
-  ).run('key_live_1', keyPrefix, secretHash, new Date().toISOString());
+     VALUES (?, 'app_portal_prod', 'Live Key', ?, ?, '["sms:send","otp:create","otp:verify"]', 'active', ?)`,
+    'key_live_1',
+    keyPrefix,
+    secretHash,
+    new Date().toISOString()
+  );
 
-  const ctx = authenticateApiKey(db, rawKey, hashApiKey);
+  const ctx = await authenticateApiKey(db, rawKey, hashApiKey);
   assert.equal(ctx.applicationId, 'app_portal_prod');
   assert.equal(ctx.environment, 'live');
 
-  db.prepare("UPDATE api_keys SET status = 'revoked', revoked_at = ? WHERE id = 'key_live_1'").run(new Date().toISOString());
-  assert.throws(
+  await db.run("UPDATE api_keys SET status = 'revoked', revoked_at = ? WHERE id = 'key_live_1'", new Date().toISOString());
+  await assert.rejects(
     () => authenticateApiKey(db, rawKey, hashApiKey),
     (err: unknown) => err instanceof AppError && err.code === 'KEY_REVOKED'
   );
 });
 
-test('Idempotency-Key deduplicates repeated SMS requests without creating duplicate jobs', () => {
-  const db = createIsolatedTestDb();
+test('Idempotency-Key deduplicates repeated SMS requests without creating duplicate jobs', async () => {
+  const db = await createIsolatedTestDb();
 
-  const first = createSmsRequest(db, {
+  const first = await createSmsRequest(db, {
     applicationId: 'app_portal_prod',
     to: '+919876543210',
     templateCode: 'login_notice',
@@ -83,7 +93,7 @@ test('Idempotency-Key deduplicates repeated SMS requests without creating duplic
     idempotencyKey: 'idem_live_001',
     actorId: 'test',
   });
-  const second = createSmsRequest(db, {
+  const second = await createSmsRequest(db, {
     applicationId: 'app_portal_prod',
     to: '+919876543210',
     templateCode: 'login_notice',
@@ -98,10 +108,10 @@ test('Idempotency-Key deduplicates repeated SMS requests without creating duplic
   assert.equal(first.message_id, second.message_id);
 });
 
-test('OTP challenge verifies once from encrypted outbound payload, rejects replay, and locks after 5 bad attempts', () => {
-  const db = createIsolatedTestDb();
+test('OTP challenge verifies once from encrypted outbound payload, rejects replay, and locks after 5 bad attempts', async () => {
+  const db = await createIsolatedTestDb();
 
-  const created = createOtpChallenge(db, {
+  const created = await createOtpChallenge(db, {
     applicationId: 'app_portal_prod',
     to: '+919876543210',
     purpose: 'login',
@@ -111,13 +121,14 @@ test('OTP challenge verifies once from encrypted outbound payload, rejects repla
   });
 
   // Confirm DB OTP row stores only HMAC hash (not plaintext), while outbound SMS body is encrypted
-  const otpRow = db.prepare('SELECT code_hash, message_id FROM otp_challenges WHERE id = ?').get(created.challenge_id) as {
-    code_hash: string;
-    message_id: string;
-  };
-  const msgRow = db.prepare('SELECT body_encrypted FROM messages WHERE id = ?').get(otpRow.message_id) as {
-    body_encrypted: string;
-  };
+  const otpRow = (await db.get<{ code_hash: string; message_id: string }>(
+    'SELECT code_hash, message_id FROM otp_challenges WHERE id = ?',
+    created.challenge_id
+  ))!;
+  const msgRow = (await db.get<{ body_encrypted: string }>(
+    'SELECT body_encrypted FROM messages WHERE id = ?',
+    otpRow.message_id
+  ))!;
   const smsBody = decryptField(msgRow.body_encrypted);
   const match = /\b(\d{6})\b/.exec(smsBody);
   assert.ok(match, 'Queued encrypted SMS payload should contain 6-digit OTP');
@@ -126,19 +137,19 @@ test('OTP challenge verifies once from encrypted outbound payload, rejects repla
   assert.notEqual(otpRow.code_hash, code);
   assert.equal(otpRow.code_hash, hashOtpCode(created.challenge_id, code));
 
-  const verified = verifyOtpChallenge(db, {
+  const verified = await verifyOtpChallenge(db, {
     applicationId: 'app_portal_prod',
     challengeId: created.challenge_id,
     code,
   });
   assert.equal(verified.verified, true);
 
-  assert.throws(
+  await assert.rejects(
     () => verifyOtpChallenge(db, { applicationId: 'app_portal_prod', challengeId: created.challenge_id, code }),
     (err: unknown) => err instanceof AppError && err.code === 'OTP_INVALID'
   );
 
-  const created2 = createOtpChallenge(db, {
+  const created2 = await createOtpChallenge(db, {
     applicationId: 'app_portal_prod',
     to: '+919811223344',
     purpose: 'login',
@@ -147,21 +158,21 @@ test('OTP challenge verifies once from encrypted outbound payload, rejects repla
     bypassCooldown: true,
   });
   for (let i = 0; i < 5; i++) {
-    assert.throws(
+    await assert.rejects(
       () => verifyOtpChallenge(db, { applicationId: 'app_portal_prod', challengeId: created2.challenge_id, code: '000000' }),
       (err: unknown) => err instanceof AppError && err.code === 'OTP_INVALID'
     );
   }
-  const lockedRow = db.prepare('SELECT status, attempts FROM otp_challenges WHERE id = ?').get(created2.challenge_id) as {
-    status: string;
-    attempts: number;
-  };
+  const lockedRow = (await db.get<{ status: string; attempts: number }>(
+    'SELECT status, attempts FROM otp_challenges WHERE id = ?',
+    created2.challenge_id
+  ))!;
   assert.equal(lockedRow.status, 'locked');
   assert.equal(lockedRow.attempts, 5);
 });
 
 test('Admin endpoints enforce strict 401 auth, CSRF protection, enrollment -> SIM creation -> lease/TTL lifecycle, and SSRF protection', async () => {
-  const db = createIsolatedTestDb();
+  const db = await createIsolatedTestDb();
 
   await assert.rejects(
     () => assertPublicWebhookHost('https://127.0.0.1/hook'),
@@ -220,7 +231,7 @@ test('Admin endpoints enforce strict 401 auth, CSRF protection, enrollment -> SI
     assert.equal(enrollRes.status, 201);
     const enrolled = (await enrollRes.json()) as { device_id: string; device_token: string };
 
-    const simRow = db.prepare('SELECT id FROM sims WHERE device_id = ?').get(enrolled.device_id) as { id: string } | undefined;
+    const simRow = await db.get<{ id: string }>('SELECT id FROM sims WHERE device_id = ?', enrolled.device_id);
     assert.ok(simRow, 'Enrolling a gateway device should initialize its SIM quota record');
 
     // 6. Heartbeat updates permission/SIM readiness
@@ -245,7 +256,7 @@ test('Admin endpoints enforce strict 401 auth, CSRF protection, enrollment -> SI
     assert.equal(hbRes.status, 200);
 
     // 7. Queue live SMS, lease by device, test lease expiry & TTL expiry via sweeper
-    const sms = createSmsRequest(db, {
+    const sms = await createSmsRequest(db, {
       applicationId: 'app_portal_prod',
       to: '+919876543210',
       templateCode: 'login_notice',
@@ -254,28 +265,33 @@ test('Admin endpoints enforce strict 401 auth, CSRF protection, enrollment -> SI
       actorId: 'test',
     });
 
-    const leased = leaseNextGatewayJob(db, enrolled.device_id);
+    const leased = await leaseNextGatewayJob(db, enrolled.device_id);
     assert.ok(leased);
     assert.equal(leased.job_id, sms.message_id);
 
-    markJobAcceptedByDevice(db, enrolled.device_id, leased.job_id);
-    db.prepare('UPDATE gateway_job_leases SET lease_expires_at = ? WHERE message_id = ?').run(
+    await markJobAcceptedByDevice(db, enrolled.device_id, leased.job_id);
+    await db.run(
+      'UPDATE gateway_job_leases SET lease_expires_at = ? WHERE message_id = ?',
       new Date(Date.now() - 10_000).toISOString(),
       sms.message_id
     );
-    const tick = runSweeperTick(db);
+    const tick = await runSweeperTick(db);
     assert.equal(tick.requeuedLeases, 1);
 
-    const msgAfterRequeue = db.prepare('SELECT status FROM messages WHERE id = ?').get(sms.message_id) as { status: string };
+    const msgAfterRequeue = (await db.get<{ status: string }>('SELECT status FROM messages WHERE id = ?', sms.message_id))!;
     assert.equal(msgAfterRequeue.status, 'queued');
 
-    db.prepare('UPDATE messages SET ttl_expires_at = ? WHERE id = ?').run(new Date(Date.now() - 5000).toISOString(), sms.message_id);
-    const tick2 = runSweeperTick(db);
+    await db.run(
+      'UPDATE messages SET ttl_expires_at = ? WHERE id = ?',
+      new Date(Date.now() - 5000).toISOString(),
+      sms.message_id
+    );
+    const tick2 = await runSweeperTick(db);
     assert.equal(tick2.expiredMessages, 1);
-    const expiredRow = db.prepare('SELECT status, error_code FROM messages WHERE id = ?').get(sms.message_id) as {
-      status: string;
-      error_code: string;
-    };
+    const expiredRow = (await db.get<{ status: string; error_code: string }>(
+      'SELECT status, error_code FROM messages WHERE id = ?',
+      sms.message_id
+    ))!;
     assert.equal(expiredRow.status, 'expired');
     assert.equal(expiredRow.error_code, 'TTL_EXPIRED');
 
@@ -310,27 +326,37 @@ test('resolveDbPath handles empty strings, sqlite:// URIs, and relative paths', 
   assert.equal(resolveDbPath('sqlite://./data/custom.db'), path.resolve(process.cwd(), 'data/custom.db'));
 });
 
-test('syncEnvAdminCredentials updates existing owner email/password when .env values change without clobbering unchanged restarts', () => {
-  const db = createIsolatedTestDb();
+test('convertPlaceholdersToPostgres converts SQL bind ? without modifying string literals or comments', () => {
+  const input =
+    "SELECT * FROM messages WHERE status = '?' AND id = ? /* comment ? */ AND note = 'it''s ?' AND app = ?";
+  const output = convertPlaceholdersToPostgres(input);
+  assert.equal(
+    output,
+    "SELECT * FROM messages WHERE status = '?' AND id = $1 /* comment ? */ AND note = 'it''s ?' AND app = $2"
+  );
+});
+
+test('syncEnvAdminCredentials updates existing owner email/password when .env values change without clobbering unchanged restarts', async () => {
+  const db = await createIsolatedTestDb();
 
   // Updating via .env overrides updates the seeded owner user
-  const updated1 = syncEnvAdminCredentials(db, { email: 'admin@example.org', password: 'NewStrongPassword!99' });
+  const updated1 = await syncEnvAdminCredentials(db, { email: 'admin@example.org', password: 'NewStrongPassword!99' });
   assert.equal(updated1, true);
-  const row1 = db.prepare("SELECT email, password_hash FROM users WHERE id = 'usr_owner_primary'").get() as {
-    email: string;
-    password_hash: string;
-  };
+  const row1 = (await db.get<{ email: string; password_hash: string }>(
+    "SELECT email, password_hash FROM users WHERE id = 'usr_owner_primary'"
+  ))!;
   assert.equal(row1.email, 'admin@example.org');
   assert.equal(verifyPassword('NewStrongPassword!99', row1.password_hash), true);
 
   // Calling again with identical .env values is a no-op so UI password changes are preserved
-  const updated2 = syncEnvAdminCredentials(db, { email: 'admin@example.org', password: 'NewStrongPassword!99' });
+  const updated2 = await syncEnvAdminCredentials(db, { email: 'admin@example.org', password: 'NewStrongPassword!99' });
   assert.equal(updated2, false);
 
   // Changing password in .env again triggers another sync
-  const updated3 = syncEnvAdminCredentials(db, { email: 'admin@example.org', password: 'RotatedEnvPassword!22' });
+  const updated3 = await syncEnvAdminCredentials(db, { email: 'admin@example.org', password: 'RotatedEnvPassword!22' });
   assert.equal(updated3, true);
-  const row2 = db.prepare("SELECT password_hash FROM users WHERE id = 'usr_owner_primary'").get() as { password_hash: string };
+  const row2 = (await db.get<{ password_hash: string }>(
+    "SELECT password_hash FROM users WHERE id = 'usr_owner_primary'"
+  ))!;
   assert.equal(verifyPassword('RotatedEnvPassword!22', row2.password_hash), true);
 });
-

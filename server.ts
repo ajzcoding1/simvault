@@ -1,77 +1,24 @@
 import 'dotenv/config';
-import express, { Request, Response, NextFunction } from 'express';
+import express, { Request, Response } from 'express';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { closeDb, getDb } from './server/db';
-import { createV1Router } from './server/routes/v1';
-import { createAdminRouter } from './server/routes/admin';
+import { closeDb } from './server/db';
+import { createSimVaultApp } from './server/app';
 import { runSweeperTick } from './server/services';
 
 async function startServer() {
-  const app = express();
-  app.set('trust proxy', 1);
-  app.disable('x-powered-by');
-
   const host = process.env.HOST ?? '0.0.0.0';
   const port = Number(process.env.PORT ?? 3000);
   const isProd = process.env.NODE_ENV === 'production';
-  const db = getDb();
 
-  // Security headers (Doc 07)
-  app.use((req: Request, res: Response, next: NextFunction) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-    res.setHeader('Referrer-Policy', 'no-referrer');
-    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-    if (req.path.startsWith('/api') || req.path.startsWith('/v1')) {
-      res.setHeader('Cache-Control', 'no-store');
-    }
-    next();
-  });
-
-  app.use(express.json({ limit: '64kb' }));
-
-  // Public health endpoint (no secrets)
-  app.get('/health', (_req: Request, res: Response) => {
-    const queueRow = db
-      .prepare("SELECT COUNT(*) as count FROM messages WHERE status IN ('created', 'queued', 'leased', 'accepted_by_device')")
-      .get() as { count: number };
-    const onlineDevices = db
-      .prepare("SELECT COUNT(*) as count FROM gateway_devices WHERE status = 'online'")
-      .get() as { count: number };
-    res.json({
-      status: 'ok',
-      version: '1.0.0',
-      mode: isProd ? 'production' : 'development',
-      uptime_seconds: Math.floor(process.uptime()),
-      timestamp: new Date().toISOString(),
-      queue_depth: queueRow.count,
-      gateway_devices_online: onlineDevices.count,
-    });
-  });
-
-  // Public v1 Application & Gateway Device APIs
-  app.use('/v1', createV1Router(db));
-
-  // Owner Dashboard APIs
-  app.use('/api/admin', createAdminRouter(db));
-
-  // Return structured JSON 404 for unknown API/gateway routes instead of HTML fallback
-  app.use('/v1', (_req: Request, res: Response) => {
-    res.status(404).json({ error: { code: 'NOT_FOUND', message: 'API endpoint not found.' } });
-  });
-  app.use('/api', (_req: Request, res: Response) => {
-    res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Admin API endpoint not found.' } });
-  });
+  const { app, db } = await createSimVaultApp();
 
   // Background queue sweeper (stale leases, device offline detection, OTP expiry, webhook retries)
   const sweeperTimer = setInterval(() => {
-    try {
-      runSweeperTick(db);
-    } catch {
+    void runSweeperTick(db).catch(() => {
       // Keep background worker resilient
-    }
+    });
   }, 2500);
   sweeperTimer.unref();
 
@@ -121,12 +68,10 @@ async function startServer() {
     console.log(`Received ${signal}, shutting down SimVault gracefully...`);
     clearInterval(sweeperTimer);
     httpServer.close(() => {
-      closeDb();
-      process.exit(0);
+      void closeDb().finally(() => process.exit(0));
     });
     setTimeout(() => {
-      closeDb();
-      process.exit(1);
+      void closeDb().finally(() => process.exit(1));
     }, 8000).unref();
   };
 
@@ -134,7 +79,7 @@ async function startServer() {
   process.on('SIGINT', () => shutdown('SIGINT'));
 
   httpServer.listen(port, host, () => {
-    console.log(`SimVault server (${isProd ? 'production' : 'development'}) listening on http://${host}:${port}`);
+    console.log(`SimVault server (${isProd ? 'production' : 'development'}, db=${db.dialect}) listening on http://${host}:${port}`);
   });
 }
 
