@@ -14,8 +14,8 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
 
   try {
     const [{ getDb }, { runSweeperTick }] = await Promise.all([
-      import('../../server/db'),
-      import('../../server/services'),
+      import('../db'),
+      import('../services'),
     ]);
     const db = await getDb();
     const result = await runSweeperTick(db);

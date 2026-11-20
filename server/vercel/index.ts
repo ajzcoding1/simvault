@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 export default async function handler(req: IncomingMessage, res: ServerResponse): Promise<void> {
   try {
-    const { getSharedSimVaultApp } = await import('../server/app');
+    const { getSharedSimVaultApp } = await import('../app');
     const { app } = await getSharedSimVaultApp();
 
     // If the serverless runtime already parsed req.body and ended the stream, tell body-parser not to hang
