@@ -520,52 +520,79 @@ async function getDb(dbPath) {
     }
     let client;
     if (pgUrl) {
-      let connectionString = pgUrl;
-      let useSsl = { rejectUnauthorized: false };
-      try {
-        const parsed = new URL(pgUrl);
-        if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") {
-          useSsl = false;
-        } else {
-          const sslMode = parsed.searchParams.get("sslmode");
-          if (sslMode === "verify-full") {
-            useSsl = { rejectUnauthorized: true };
-          } else if (sslMode) {
-            parsed.searchParams.delete("sslmode");
-            connectionString = parsed.toString();
+      const connectPostgresClient = async (targetUrl) => {
+        let connectionString = targetUrl;
+        let useSsl = { rejectUnauthorized: false };
+        try {
+          const parsed = new URL(targetUrl);
+          if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") {
+            useSsl = false;
+          } else {
+            const sslMode = parsed.searchParams.get("sslmode");
+            if (sslMode === "verify-full") {
+              useSsl = { rejectUnauthorized: true };
+            } else if (sslMode) {
+              parsed.searchParams.delete("sslmode");
+              connectionString = parsed.toString();
+            }
           }
+        } catch {
         }
-      } catch {
-      }
-      const pool = new PgPool({
-        connectionString,
-        ssl: useSsl,
-        max: process.env.VERCEL ? 5 : 10,
-        idleTimeoutMillis: 2e4,
-        connectionTimeoutMillis: 1e4
-      });
-      pool.on("error", (err) => {
-        console.error("[SimVault pg pool]", err.message);
-      });
-      const pgClient = new PostgresDbClient(pool);
-      try {
-        await pgClient.transaction(async (tx) => {
-          await tx.exec("SELECT pg_advisory_xact_lock(84729103);");
-          await migrateSchema(tx);
-          await seedInitialData(tx);
-          await syncEnvAdminCredentials(tx);
+        const pool = new PgPool({
+          connectionString,
+          ssl: useSsl,
+          max: process.env.VERCEL ? 5 : 10,
+          idleTimeoutMillis: 2e4,
+          connectionTimeoutMillis: 1e4
         });
+        pool.on("error", (err) => {
+          console.error("[SimVault pg pool]", err.message);
+        });
+        const pgClient = new PostgresDbClient(pool);
+        try {
+          await pgClient.transaction(async (tx) => {
+            await tx.exec("SELECT pg_advisory_xact_lock(84729103);");
+            await migrateSchema(tx);
+            await seedInitialData(tx);
+            await syncEnvAdminCredentials(tx);
+          });
+          return pgClient;
+        } catch (err) {
+          await pool.end().catch(() => void 0);
+          throw err;
+        }
+      };
+      try {
+        client = await connectPostgresClient(pgUrl);
       } catch (err) {
-        await pool.end().catch(() => void 0);
         const msg = err instanceof Error ? err.message : String(err);
-        if (/ENETUNREACH|EAI_AGAIN|ECONNREFUSED/i.test(msg) && pgUrl.includes(":5432")) {
+        const isTenantNotFound = /tenant.*not found/i.test(msg);
+        const hasAws0Pooler = /@aws-0-([a-z0-9-]+)\.pooler\.supabase\.com/i.test(pgUrl);
+        if (isTenantNotFound && hasAws0Pooler && !process.env.SUPABASE_DB_POOLER_HOST?.trim()) {
+          const aws1Url = pgUrl.replace(/@aws-0-([a-z0-9-]+)\.pooler\.supabase\.com/i, "@aws-1-$1.pooler.supabase.com");
+          try {
+            client = await connectPostgresClient(aws1Url);
+          } catch (retryErr) {
+            const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+            if (/tenant.*not found/i.test(retryMsg)) {
+              throw new Error(
+                `Supabase pooler returned "${retryMsg}". Either your SUPABASE_DB_REGION does not match the project's actual region, the project is paused, or you should paste the exact Transaction Pooler URI from Supabase Dashboard -> Connect into SUPABASE_DB_URL.`
+              );
+            }
+            throw retryErr;
+          }
+        } else if (isTenantNotFound) {
+          throw new Error(
+            `Supabase pooler returned "${msg}". Check Supabase Dashboard -> Connect -> Transaction Pooler for the exact pooler host (aws-0 vs aws-1 & region) and project ref, and paste that URI into SUPABASE_DB_URL.`
+          );
+        } else if (/ENETUNREACH|EAI_AGAIN|ECONNREFUSED/i.test(msg) && pgUrl.includes(":5432")) {
           throw new Error(
             `Cannot reach Supabase direct port 5432 from this IPv4 serverless environment (${msg}). Set SUPABASE_DB_REGION (e.g. ap-south-1) or paste the port 6543 Transaction Pooler URI into SUPABASE_DB_URL.`
           );
+        } else {
+          throw err;
         }
-        throw err;
       }
-      client = pgClient;
     } else {
       const explicitDbPath = (dbPath !== void 0 ? dbPath : process.env.SIMVAULT_DB_PATH)?.trim() ?? "";
       const allowEphemeralSqliteOnVercel = explicitDbPath === ":memory:" || explicitDbPath.startsWith("/tmp/");
