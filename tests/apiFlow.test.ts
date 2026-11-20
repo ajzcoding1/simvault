@@ -9,6 +9,7 @@ import {
   createIsolatedTestDb,
   DbClient,
   resolveDbPath,
+  resolvePostgresUrl,
   syncEnvAdminCredentials,
 } from '../server/db';
 import { decryptField, generateApiKey, hashApiKey, hashOtpCode, verifyPassword } from '../server/crypto';
@@ -360,3 +361,46 @@ test('syncEnvAdminCredentials updates existing owner email/password when .env va
   ))!;
   assert.equal(verifyPassword('RotatedEnvPassword!22', row2.password_hash), true);
 });
+
+test('resolvePostgresUrl supports SUPABASE_DB_URL, quote stripping, POSTGRES_URL, and SUPABASE_URL + SUPABASE_DB_PASSWORD + SUPABASE_DB_REGION', () => {
+  assert.equal(
+    resolvePostgresUrl({
+      SUPABASE_DB_URL: '"postgresql://postgres.ref:pass@aws-0-ap-south-1.pooler.supabase.com:6543/postgres"',
+    }),
+    'postgresql://postgres.ref:pass@aws-0-ap-south-1.pooler.supabase.com:6543/postgres'
+  );
+
+  assert.equal(
+    resolvePostgresUrl({
+      POSTGRES_URL: " 'postgresql://user:pass@localhost:5432/simvault' ",
+    }),
+    'postgresql://user:pass@localhost:5432/simvault'
+  );
+
+  assert.equal(
+    resolvePostgresUrl({
+      SUPABASE_URL: 'https://nysrogpulcrnvgprbczh.supabase.co',
+      SUPABASE_DB_PASSWORD: 'p@ss#word!',
+      SUPABASE_DB_REGION: 'ap-south-1',
+    }),
+    'postgresql://postgres.nysrogpulcrnvgprbczh:p%40ss%23word!@aws-0-ap-south-1.pooler.supabase.com:6543/postgres'
+  );
+
+  assert.equal(
+    resolvePostgresUrl({
+      SUPABASE_URL: 'https://nysrogpulcrnvgprbczh.supabase.co',
+      SUPABASE_DB_PASSWORD: 'secret',
+      SUPABASE_DB_POOLER_HOST: 'aws-1-ap-south-1.pooler.supabase.com',
+    }),
+    'postgresql://postgres.nysrogpulcrnvgprbczh:secret@aws-1-ap-south-1.pooler.supabase.com:6543/postgres'
+  );
+
+  assert.equal(
+    resolvePostgresUrl({
+      SUPABASE_URL: 'https://nysrogpulcrnvgprbczh.supabase.co',
+      SUPABASE_DB_PASSWORD: 'secret',
+    }),
+    'postgresql://postgres:secret@db.nysrogpulcrnvgprbczh.supabase.co:5432/postgres'
+  );
+});
+

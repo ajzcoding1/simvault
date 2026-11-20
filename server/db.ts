@@ -492,19 +492,43 @@ function stripOuterQuotes(value: string): string {
   return trimmed;
 }
 
-export function resolvePostgresUrl(): string | null {
+export function resolvePostgresUrl(env: Record<string, string | undefined> = process.env): string | null {
   const raw =
-    process.env.SUPABASE_DB_URL ||
-    process.env.DATABASE_URL ||
-    process.env.POSTGRES_URL ||
-    process.env.POSTGRES_PRISMA_URL ||
-    process.env.POSTGRES_URL_NON_POOLING ||
+    env.SUPABASE_DB_URL ||
+    env.DATABASE_URL ||
+    env.POSTGRES_URL ||
+    env.POSTGRES_PRISMA_URL ||
+    env.POSTGRES_URL_NON_POOLING ||
     '';
   const candidate = stripOuterQuotes(raw);
-  if (!candidate) return null;
-  if (/^postgres(ql)?:\/\//i.test(candidate)) {
+  if (candidate && /^postgres(ql)?:\/\//i.test(candidate)) {
     return candidate;
   }
+
+  const supabaseUrl = stripOuterQuotes(env.SUPABASE_URL || '');
+  const supabaseDbPassword = stripOuterQuotes(env.SUPABASE_DB_PASSWORD || '');
+  if (supabaseUrl && supabaseDbPassword) {
+    try {
+      const parsed = new URL(supabaseUrl);
+      const match = /^([a-z0-9-]+)\.supabase\.co$/i.exec(parsed.hostname);
+      if (match) {
+        const ref = match[1];
+        const encodedPass = encodeURIComponent(supabaseDbPassword);
+        const poolerHost = stripOuterQuotes(env.SUPABASE_DB_POOLER_HOST || '');
+        const region = stripOuterQuotes(env.SUPABASE_DB_REGION || '');
+        if (poolerHost) {
+          return `postgresql://postgres.${ref}:${encodedPass}@${poolerHost}:6543/postgres`;
+        }
+        if (region) {
+          return `postgresql://postgres.${ref}:${encodedPass}@aws-0-${region}.pooler.supabase.com:6543/postgres`;
+        }
+        return `postgresql://postgres:${encodedPass}@db.${ref}.supabase.co:5432/postgres`;
+      }
+    } catch {
+      // Ignore malformed SUPABASE_URL
+    }
+  }
+
   return null;
 }
 
@@ -549,7 +573,7 @@ export async function getDb(dbPath?: string): Promise<DbClient> {
     );
     if (dbPath === undefined && rawPgCandidate && /^https?:\/\//i.test(rawPgCandidate)) {
       throw new Error(
-        'SUPABASE_DB_URL/DATABASE_URL appears to be an https:// API URL. Please paste the PostgreSQL URI (postgresql://...) from Supabase Dashboard -> Connect -> Transaction Pooler (port 6543).'
+        'SUPABASE_DB_URL/DATABASE_URL appears to be an https:// API URL. Either paste the postgresql:// Transaction Pooler URI from Supabase -> Connect, or use SUPABASE_URL + SUPABASE_DB_PASSWORD + SUPABASE_DB_REGION.'
       );
     }
 
@@ -576,12 +600,23 @@ export async function getDb(dbPath?: string): Promise<DbClient> {
       });
 
       const pgClient = new PostgresDbClient(pool);
-      await pgClient.transaction(async (tx) => {
-        await tx.exec('SELECT pg_advisory_xact_lock(84729103);');
-        await migrateSchema(tx);
-        await seedInitialData(tx);
-        await syncEnvAdminCredentials(tx);
-      });
+      try {
+        await pgClient.transaction(async (tx) => {
+          await tx.exec('SELECT pg_advisory_xact_lock(84729103);');
+          await migrateSchema(tx);
+          await seedInitialData(tx);
+          await syncEnvAdminCredentials(tx);
+        });
+      } catch (err) {
+        await pool.end().catch(() => undefined);
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/ENETUNREACH|EAI_AGAIN|ECONNREFUSED/i.test(msg) && pgUrl.includes(':5432')) {
+          throw new Error(
+            `Cannot reach Supabase direct port 5432 from this IPv4 serverless environment (${msg}). Set SUPABASE_DB_REGION (e.g. ap-south-1) or paste the port 6543 Transaction Pooler URI into SUPABASE_DB_URL.`
+          );
+        }
+        throw err;
+      }
       client = pgClient;
     } else {
       const explicitDbPath = (dbPath !== undefined ? dbPath : process.env.SIMVAULT_DB_PATH)?.trim() ?? '';
