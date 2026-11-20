@@ -41,6 +41,7 @@ import { ApiDocsView } from './components/ApiDocsView';
 import { AuditLogsView, SecurityView } from './components/SecurityAndAuditView';
 import { SettingsAndInfraView } from './components/SettingsAndInfraView';
 import { SendTestSmsModal } from './components/SendTestSmsModal';
+import { PublicPortal } from './components/PublicPortal';
 
 const NAV_GROUPS: Array<{
   heading: string;
@@ -285,88 +286,20 @@ export default function App() {
 
   if (!authenticated) {
     return (
-      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex flex-col items-center justify-center p-4 relative">
-        <div className="absolute top-4 right-4">
-          <button
-            type="button"
-            onClick={cycleTheme}
-            aria-label={`Switch color theme (current: ${themeLabel})`}
-            title={`Theme: ${themeLabel} (click to cycle Auto / Dark / Light)`}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
-          >
-            <ThemeIcon className="w-3.5 h-3.5" aria-hidden="true" />
-            <span>Theme: {themeLabel}</span>
-          </button>
-        </div>
-
-        <form
-          onSubmit={handleLogin}
-          className="w-full max-w-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-6 space-y-4 shadow-sm"
-        >
-          <div>
-            <h1 className="text-lg font-bold text-slate-900 dark:text-slate-50">SimVault Owner Console</h1>
-            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-              Live mode active. Sign in to manage Android gateways, SIM quotas, and API keys.
-            </p>
-          </div>
-          <div>
-            <label htmlFor="login-email" className="block text-xs font-medium text-slate-700 mb-1">
-              Owner Email
-            </label>
-            <input
-              id="login-email"
-              type="email"
-              required
-              autoComplete="username"
-              value={loginEmail}
-              onChange={(e) => setLoginEmail(e.target.value)}
-              placeholder="owner@simvault.local"
-              className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md text-slate-900"
-            />
-          </div>
-          <div>
-            <label htmlFor="login-password" className="block text-xs font-medium text-slate-700 mb-1">
-              Password
-            </label>
-            <input
-              id="login-password"
-              type="password"
-              required
-              autoComplete="current-password"
-              value={loginPassword}
-              onChange={(e) => setLoginPassword(e.target.value)}
-              placeholder="Enter owner password"
-              className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md text-slate-900"
-            />
-          </div>
-          {mfaPrompt && (
-            <div>
-              <label htmlFor="login-totp" className="block text-xs font-medium text-slate-700 mb-1">
-                Authenticator Code (6 digits)
-              </label>
-              <input
-                id="login-totp"
-                type="text"
-                required
-                value={loginTotp}
-                onChange={(e) => setLoginTotp(e.target.value)}
-                placeholder="123456"
-                className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-md text-slate-900"
-              />
-            </div>
-          )}
-          {loginError && <p className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded p-2">{loginError}</p>}
-          <button
-            type="submit"
-            className="w-full py-2 px-4 text-xs font-medium bg-slate-900 dark:bg-blue-600 text-white rounded-md hover:bg-slate-800 dark:hover:bg-blue-500 transition-colors"
-          >
-            {mfaPrompt ? 'Verify MFA & Sign In' : 'Sign In'}
-          </button>
-          <p className="text-[11px] text-slate-400 dark:text-slate-500">
-            Update initial bootstrap credentials under Governance → Security &amp; Limits after sign-in.
-          </p>
-        </form>
-      </div>
+      <PublicPortal
+        loginEmail={loginEmail}
+        onLoginEmailChange={setLoginEmail}
+        loginPassword={loginPassword}
+        onLoginPasswordChange={setLoginPassword}
+        loginTotp={loginTotp}
+        onLoginTotpChange={setLoginTotp}
+        mfaPrompt={mfaPrompt}
+        loginError={loginError}
+        onLoginSubmit={handleLogin}
+        themeMode={themeMode}
+        themeLabel={themeLabel}
+        onCycleTheme={cycleTheme}
+      />
     );
   }
 
