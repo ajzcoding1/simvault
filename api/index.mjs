@@ -470,7 +470,7 @@ function resolvePostgresUrl(env = process.env) {
   if (candidate && /^postgres(ql)?:\/\//i.test(candidate)) {
     return candidate;
   }
-  const supabaseUrl = stripOuterQuotes(env.SUPABASE_URL || "");
+  const supabaseUrl = stripOuterQuotes(env.SUPABASE_URL || "") || (/^https?:\/\//i.test(candidate) ? candidate : "");
   const supabaseDbPassword = stripOuterQuotes(env.SUPABASE_DB_PASSWORD || "");
   if (supabaseUrl && supabaseDbPassword) {
     try {
@@ -512,12 +512,12 @@ async function getDb(dbPath) {
     const rawPgCandidate = stripOuterQuotes(
       process.env.SUPABASE_DB_URL || process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL || process.env.POSTGRES_URL_NON_POOLING || ""
     );
-    if (dbPath === void 0 && rawPgCandidate && /^https?:\/\//i.test(rawPgCandidate)) {
+    const pgUrl = dbPath === void 0 ? resolvePostgresUrl() : null;
+    if (!pgUrl && dbPath === void 0 && rawPgCandidate && /^https?:\/\//i.test(rawPgCandidate)) {
       throw new Error(
-        "SUPABASE_DB_URL/DATABASE_URL appears to be an https:// API URL. Either paste the postgresql:// Transaction Pooler URI from Supabase -> Connect, or use SUPABASE_URL + SUPABASE_DB_PASSWORD + SUPABASE_DB_REGION."
+        "SUPABASE_DB_URL/DATABASE_URL appears to be an https:// API URL. Either paste the postgresql:// Transaction Pooler URI from Supabase -> Connect, or add SUPABASE_DB_PASSWORD + SUPABASE_DB_REGION (or use SUPABASE_URL)."
       );
     }
-    const pgUrl = dbPath === void 0 ? resolvePostgresUrl() : null;
     let client;
     if (pgUrl) {
       let connectionString = pgUrl;

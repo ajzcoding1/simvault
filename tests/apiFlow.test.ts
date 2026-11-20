@@ -402,5 +402,14 @@ test('resolvePostgresUrl supports SUPABASE_DB_URL, quote stripping, POSTGRES_URL
     }),
     'postgresql://postgres:secret@db.nysrogpulcrnvgprbczh.supabase.co:5432/postgres'
   );
+
+  assert.equal(
+    resolvePostgresUrl({
+      SUPABASE_DB_URL: 'https://nysrogpulcrnvgprbczh.supabase.co',
+      SUPABASE_DB_PASSWORD: 'p@ss#word!',
+      SUPABASE_DB_REGION: 'ap-south-1',
+    }),
+    'postgresql://postgres.nysrogpulcrnvgprbczh:p%40ss%23word!@aws-0-ap-south-1.pooler.supabase.com:6543/postgres'
+  );
 });
 

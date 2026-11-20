@@ -505,7 +505,8 @@ export function resolvePostgresUrl(env: Record<string, string | undefined> = pro
     return candidate;
   }
 
-  const supabaseUrl = stripOuterQuotes(env.SUPABASE_URL || '');
+  const supabaseUrl =
+    stripOuterQuotes(env.SUPABASE_URL || '') || (/^https?:\/\//i.test(candidate) ? candidate : '');
   const supabaseDbPassword = stripOuterQuotes(env.SUPABASE_DB_PASSWORD || '');
   if (supabaseUrl && supabaseDbPassword) {
     try {
@@ -571,13 +572,12 @@ export async function getDb(dbPath?: string): Promise<DbClient> {
         process.env.POSTGRES_URL_NON_POOLING ||
         ''
     );
-    if (dbPath === undefined && rawPgCandidate && /^https?:\/\//i.test(rawPgCandidate)) {
+    const pgUrl = dbPath === undefined ? resolvePostgresUrl() : null;
+    if (!pgUrl && dbPath === undefined && rawPgCandidate && /^https?:\/\//i.test(rawPgCandidate)) {
       throw new Error(
-        'SUPABASE_DB_URL/DATABASE_URL appears to be an https:// API URL. Either paste the postgresql:// Transaction Pooler URI from Supabase -> Connect, or use SUPABASE_URL + SUPABASE_DB_PASSWORD + SUPABASE_DB_REGION.'
+        'SUPABASE_DB_URL/DATABASE_URL appears to be an https:// API URL. Either paste the postgresql:// Transaction Pooler URI from Supabase -> Connect, or add SUPABASE_DB_PASSWORD + SUPABASE_DB_REGION (or use SUPABASE_URL).'
       );
     }
-
-    const pgUrl = dbPath === undefined ? resolvePostgresUrl() : null;
 
     let client: DbClient;
     if (pgUrl) {
