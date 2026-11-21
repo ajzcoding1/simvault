@@ -63,8 +63,8 @@ export function maskE164(phone: string): string {
 const ALLOWED_TRANSITIONS: Record<MessageStatus, MessageStatus[]> = {
   created: ['queued', 'failed', 'expired'],
   queued: ['leased', 'expired', 'failed'],
-  leased: ['accepted_by_device', 'queued', 'sent_to_network', 'delivery_unknown', 'failed', 'expired'],
-  accepted_by_device: ['sent_to_network', 'delivery_unknown', 'failed', 'expired'],
+  leased: ['accepted_by_device', 'queued', 'sent_to_network', 'delivered', 'delivery_unknown', 'failed', 'expired'],
+  accepted_by_device: ['sent_to_network', 'delivered', 'delivery_unknown', 'failed', 'expired'],
   sent_to_network: ['delivered', 'delivery_unknown', 'failed'],
   delivered: [],
   delivery_unknown: ['delivered', 'failed'],

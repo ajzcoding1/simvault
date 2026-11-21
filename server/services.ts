@@ -1421,7 +1421,8 @@ export async function leaseNextGatewayJob(
     return null;
   }
 
-  const leaseTimeoutSec = Number(settings.lease_timeout_seconds ?? 30);
+  const rawLeaseSec = Number(settings.lease_timeout_seconds ?? 60);
+  const leaseTimeoutSec = Math.max(Number.isFinite(rawLeaseSec) ? rawLeaseSec : 60, 45);
   const leaseExpiresAt = new Date(now.getTime() + leaseTimeoutSec * 1000).toISOString();
 
   return db.transaction(async (tx) => {
@@ -1448,6 +1449,21 @@ export async function leaseNextGatewayJob(
     }>(candidateSql, nowIso);
 
     if (!candidate) {
+      return null;
+    }
+
+    let decryptedTo: string;
+    let decryptedBody: string;
+    try {
+      decryptedTo = decryptField(candidate.destination_encrypted);
+      decryptedBody = decryptField(candidate.body_encrypted);
+    } catch {
+      await tx.run(
+        "UPDATE messages SET status = 'failed', failed_at = ?, error_code = 'DECRYPT_ERROR' WHERE id = ?",
+        nowIso,
+        candidate.id
+      );
+      await tx.run('DELETE FROM gateway_job_leases WHERE message_id = ?', candidate.id);
       return null;
     }
 
@@ -1479,8 +1495,8 @@ export async function leaseNextGatewayJob(
     return {
       job_id: candidate.id,
       lease_token: leaseToken,
-      to: decryptField(candidate.destination_encrypted),
-      body: decryptField(candidate.body_encrypted),
+      to: decryptedTo,
+      body: decryptedBody,
       sim_slot: sim?.slot_index ?? 0,
       is_test: Boolean(candidate.is_test),
       expires_at: candidate.ttl_expires_at,
@@ -1537,7 +1553,7 @@ export async function reportJobResult(
   if (!msg || msg.device_id !== deviceId) {
     throw new AppError(404, 'JOB_NOT_FOUND', 'Job not found for this device.');
   }
-  if (msg.status === outcome || (msg.status === 'delivered' && outcome === 'sent_to_network')) {
+  if (msg.status === outcome || msg.status === 'delivered') {
     return { status: msg.status };
   }
   if (!isValidMessageTransition(msg.status, outcome)) {
@@ -1641,7 +1657,7 @@ export async function reportJobResult(
 }
 
 export async function reportDeliveryReceipt(
-  db: DbExecutor,
+  db: DbClient,
   deviceId: string,
   jobId: string
 ): Promise<{ status: MessageStatus }> {
@@ -1650,27 +1666,80 @@ export async function reportDeliveryReceipt(
     application_id: string;
     device_id: string | null;
     status: MessageStatus;
+    is_test: number;
+    sent_at: string | null;
     destination_masked: string;
-  }>('SELECT id, application_id, device_id, status, destination_masked FROM messages WHERE id = ?', jobId);
+  }>(
+    'SELECT id, application_id, device_id, status, is_test, sent_at, destination_masked FROM messages WHERE id = ?',
+    jobId
+  );
 
   if (!msg || msg.device_id !== deviceId) {
     throw new AppError(404, 'JOB_NOT_FOUND', 'Job not found for this device.');
+  }
+  if (msg.status === 'delivered') {
+    return { status: 'delivered' };
   }
   if (!isValidMessageTransition(msg.status, 'delivered')) {
     throw new AppError(409, 'INVALID_TRANSITION', `Cannot transition from ${msg.status} to delivered.`);
   }
 
   const nowIso = new Date().toISOString();
-  await db.run("UPDATE messages SET status = 'delivered', delivered_at = ?, error_code = NULL WHERE id = ?", nowIso, jobId);
-  await db.run(
-    `INSERT INTO usage_events (id, application_id, device_id, message_id, event_type, units, occurred_at)
-     VALUES (?, ?, ?, ?, 'message.delivered', 1, ?)`,
-    crypto.randomUUID(),
-    msg.application_id,
-    deviceId,
-    jobId,
-    nowIso
-  );
+  await db.transaction(async (tx) => {
+    const existingSentEvent = await tx.get<{ id: string }>(
+      "SELECT id FROM usage_events WHERE message_id = ? AND event_type = 'message.sent_to_network' LIMIT 1",
+      jobId
+    );
+    if (!existingSentEvent) {
+      const requestedUsage = await tx.get<{ units: number | string }>(
+        "SELECT units FROM usage_events WHERE message_id = ? AND event_type = 'message.requested' LIMIT 1",
+        jobId
+      );
+      const sentUnits = Math.max(1, Number(requestedUsage?.units ?? 1));
+      await tx.run(
+        `INSERT INTO usage_events (id, application_id, device_id, message_id, event_type, units, occurred_at)
+         VALUES (?, ?, ?, ?, 'message.sent_to_network', ?, ?)`,
+        crypto.randomUUID(),
+        msg.application_id,
+        deviceId,
+        jobId,
+        sentUnits,
+        nowIso
+      );
+      if (!msg.is_test) {
+        await tx.run(
+          `UPDATE sims
+           SET estimated_sms_sent = estimated_sms_sent + ?,
+               estimated_sms_remaining = CASE WHEN estimated_sms_remaining > ? THEN estimated_sms_remaining - ? ELSE 0 END,
+               updated_at = ?
+           WHERE device_id = ?`,
+          sentUnits,
+          sentUnits,
+          sentUnits,
+          nowIso,
+          deviceId
+        );
+      }
+      await tx.run("UPDATE otp_challenges SET status = 'sent' WHERE message_id = ? AND status = 'queued'", jobId);
+    }
+
+    await tx.run(
+      "UPDATE messages SET status = 'delivered', sent_at = COALESCE(sent_at, ?), delivered_at = ?, error_code = NULL WHERE id = ?",
+      nowIso,
+      nowIso,
+      jobId
+    );
+    await tx.run(
+      `INSERT INTO usage_events (id, application_id, device_id, message_id, event_type, units, occurred_at)
+       VALUES (?, ?, ?, ?, 'message.delivered', 1, ?)`,
+      crypto.randomUUID(),
+      msg.application_id,
+      deviceId,
+      jobId,
+      nowIso
+    );
+    await tx.run('DELETE FROM gateway_job_leases WHERE message_id = ?', jobId);
+  });
 
   await enqueueWebhookEvent(db, msg.application_id, 'message.status', {
     message_id: msg.id,

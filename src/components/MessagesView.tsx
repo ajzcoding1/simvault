@@ -1,13 +1,16 @@
-import { useEffect, useState } from 'react';
-import { RefreshCw, Search, X } from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
+import { AlertTriangle, RefreshCw, Search, X } from 'lucide-react';
 import { apiRequest, formatUtcShort } from '../lib/api';
-import type { ApplicationRecord, MessageRecord } from '../types';
+import type { ApplicationRecord, MessageRecord, OverviewResponse } from '../types';
 import { StatusText } from './StatusText';
 
 interface MessagesViewProps {
   applications: ApplicationRecord[];
+  overview?: OverviewResponse | null;
   onOpenSendModal: () => void;
+  onNavigateToDevices?: () => void;
   refreshSignal: number;
+  backgroundTick?: number;
 }
 
 const STATUS_FILTERS = [
@@ -21,7 +24,14 @@ const STATUS_FILTERS = [
   { id: 'expired', label: 'Expired' },
 ];
 
-export function MessagesView({ applications, onOpenSendModal, refreshSignal }: MessagesViewProps) {
+export function MessagesView({
+  applications,
+  overview,
+  onOpenSendModal,
+  onNavigateToDevices,
+  refreshSignal,
+  backgroundTick = 0,
+}: MessagesViewProps) {
   const [messages, setMessages] = useState<MessageRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -30,26 +40,42 @@ export function MessagesView({ applications, onOpenSendModal, refreshSignal }: M
   const [query, setQuery] = useState('');
   const [selectedMsg, setSelectedMsg] = useState<MessageRecord | null>(null);
 
-  const loadMessages = async () => {
-    setLoading(true);
-    setLoadError(null);
-    try {
-      const params = new URLSearchParams();
-      if (statusFilter !== 'all') params.set('status', statusFilter);
-      if (appFilter !== 'all') params.set('application_id', appFilter);
-      if (query.trim()) params.set('q', query.trim());
-      const res = await apiRequest<{ messages: MessageRecord[] }>(`/api/admin/messages?${params.toString()}`);
-      setMessages(res.messages);
-    } catch (err) {
-      setLoadError(err instanceof Error ? err.message : 'Failed to load messages');
-    } finally {
-      setLoading(false);
-    }
-  };
+  const loadMessages = useCallback(
+    async (silent = false) => {
+      if (!silent) setLoading(true);
+      setLoadError(null);
+      try {
+        const params = new URLSearchParams();
+        if (statusFilter !== 'all') params.set('status', statusFilter);
+        if (appFilter !== 'all') params.set('application_id', appFilter);
+        if (query.trim()) params.set('q', query.trim());
+        const res = await apiRequest<{ messages: MessageRecord[] }>(`/api/admin/messages?${params.toString()}`);
+        setMessages(res.messages);
+        setSelectedMsg((prev) => (prev ? res.messages.find((m) => m.id === prev.id) ?? prev : null));
+      } catch (err) {
+        setLoadError(err instanceof Error ? err.message : 'Failed to load messages');
+      } finally {
+        if (!silent) setLoading(false);
+      }
+    },
+    [statusFilter, appFilter, query]
+  );
 
   useEffect(() => {
-    void loadMessages();
+    void loadMessages(false);
   }, [statusFilter, appFilter, refreshSignal]);
+
+  useEffect(() => {
+    if (backgroundTick === 0) return;
+    void loadMessages(true);
+  }, [backgroundTick, loadMessages]);
+
+  const hasQueuedWork = messages.some(
+    (m) => m.status === 'queued' || m.status === 'leased' || m.status === 'accepted_by_device'
+  );
+  const readyOnlineDevices = (overview?.devices ?? []).filter(
+    (d) => d.status === 'online' && Boolean(d.permission_send_sms) && Boolean(d.sim_ready)
+  );
 
   return (
     <div className="space-y-5">
@@ -57,13 +83,13 @@ export function MessagesView({ applications, onOpenSendModal, refreshSignal }: M
         <div>
           <h2 className="text-base font-semibold text-slate-900">Message Queue &amp; Delivery History</h2>
           <p className="text-xs text-slate-500 mt-0.5">
-            Plaintext message bodies and full phone numbers are encrypted at rest and redacted from dashboard views.
+            Plaintext message bodies and full phone numbers are encrypted at rest and redacted from dashboard views. Auto-refreshes every 6s.
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
-            onClick={() => void loadMessages()}
+            onClick={() => void loadMessages(false)}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-slate-300 bg-white text-slate-700 rounded-md hover:bg-slate-50"
           >
             <RefreshCw className="w-3.5 h-3.5" aria-hidden="true" />
@@ -81,6 +107,35 @@ export function MessagesView({ applications, onOpenSendModal, refreshSignal }: M
 
       {loadError && (
         <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-md px-4 py-2.5">{loadError}</div>
+      )}
+
+      {hasQueuedWork && overview?.global_paused && (
+        <div className="bg-rose-50 border border-rose-200 rounded-md px-4 py-2.5 text-xs text-rose-900 flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 shrink-0" aria-hidden="true" />
+          <span>
+            Global Kill Switch is active — pending messages stay queued until outbound traffic is resumed.
+          </span>
+        </div>
+      )}
+
+      {hasQueuedWork && overview && !overview.global_paused && readyOnlineDevices.length === 0 && (
+        <div className="bg-amber-50 border border-amber-200 rounded-md px-4 py-2.5 text-xs text-amber-900 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0" aria-hidden="true" />
+            <span>
+              Messages are waiting in queue, but no online Android gateway with <code className="font-mono">SEND_SMS</code> + active SIM is polling right now.
+            </span>
+          </div>
+          {onNavigateToDevices && (
+            <button
+              type="button"
+              onClick={onNavigateToDevices}
+              className="font-medium underline whitespace-nowrap shrink-0"
+            >
+              Inspect Devices
+            </button>
+          )}
+        </div>
       )}
 
       {/* Filters Bar */}
@@ -120,7 +175,7 @@ export function MessagesView({ applications, onOpenSendModal, refreshSignal }: M
           <form
             onSubmit={(e) => {
               e.preventDefault();
-              void loadMessages();
+              void loadMessages(false);
             }}
             className="relative flex items-center"
           >

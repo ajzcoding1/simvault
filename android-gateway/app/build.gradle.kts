@@ -12,8 +12,8 @@ android {
         applicationId = "com.simvault.gateway"
         minSdk = 29
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.3.1"
+        versionCode = 5
+        versionName = "1.3.2"
 
         buildConfigField(
             "String",

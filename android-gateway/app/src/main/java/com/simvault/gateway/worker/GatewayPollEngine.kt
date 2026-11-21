@@ -38,6 +38,7 @@ object GatewayPollEngine {
 
     private const val TELEMETRY_SYNC_INTERVAL_MS = 20_000L
     private const val MAX_JOBS_PER_CYCLE = 5
+    private const val STALE_ACCEPTED_TIMEOUT_MS = 20_000L
 
     private val pollMutex = Mutex()
     private var lastTelemetrySentAtMs: Long = 0L
@@ -57,6 +58,39 @@ object GatewayPollEngine {
         val active = cm.activeNetwork ?: return false
         val caps = cm.getNetworkCapabilities(active) ?: return false
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    private fun reportResultSafely(
+        client: SimVaultGatewayClient,
+        serverUrl: String,
+        token: String,
+        jobId: String,
+        status: String,
+        errorCode: String? = null
+    ) {
+        try {
+            client.reportResult(serverUrl, token, jobId, status, errorCode)
+        } catch (e: GatewayApiException) {
+            // 404/409 means lease expired or job was already finalized (e.g. delivery receipt arrived first)
+            if (e.httpCode != 404 && e.httpCode != 409) {
+                throw e
+            }
+        }
+    }
+
+    private fun reportDeliverySafely(
+        client: SimVaultGatewayClient,
+        serverUrl: String,
+        token: String,
+        jobId: String
+    ) {
+        try {
+            client.reportDeliveryReceipt(serverUrl, token, jobId)
+        } catch (e: GatewayApiException) {
+            if (e.httpCode != 404 && e.httpCode != 409) {
+                throw e
+            }
+        }
     }
 
     suspend fun runPollCycle(context: Context): PollCycleOutcome = pollMutex.withLock {
@@ -86,7 +120,7 @@ object GatewayPollEngine {
         val sims = smsSender.listActiveSims()
         val chosenSlot = store.getSelectedSimSlot()
         val activeSim = sims.firstOrNull { it.slotIndex == chosenSlot } ?: sims.firstOrNull()
-        val simReady = store.isMockMode() || (hasPerm && activeSim != null)
+        val simReady = store.isMockMode() || (hasPerm && (activeSim != null || smsSender.hasSimHardwareReady()))
         val locallyPaused = store.isPaused()
         val batteryPct = readBatteryPct(appContext)
         val simSlot = activeSim?.slotIndex ?: chosenSlot
@@ -130,45 +164,105 @@ object GatewayPollEngine {
 
             // Process job returned in combined poll, then drain up to MAX_JOBS_PER_CYCLE queued jobs without extra idle calls
             var currentJob = pollResult.job
+            val requestReceipts = store.isDeliveryReceiptRequested()
+
             for (iteration in 0 until MAX_JOBS_PER_CYCLE) {
                 if (store.isPaused()) break
                 val job = currentJob ?: break
 
-                // Local duplicate protection across process restarts
-                if (!journal.hasProcessedOrInFlight(job.jobId)) {
+                val existing = journal.findByJobId(job.jobId)
+                if (existing == null) {
                     val jobSlot = activeSim?.slotIndex ?: chosenSlot
                     val masked = LocalJobJournal.maskE164(job.to)
                     journal.upsert(JournalEntry(job.jobId, masked, jobSlot, LocalJobState.ACCEPTED))
 
                     if (isJobExpired(job.expiresAt)) {
-                        client.reportResult(serverUrl, token, job.jobId, "failed", "TTL_EXPIRED")
                         journal.upsert(JournalEntry(job.jobId, masked, jobSlot, LocalJobState.FAILED, "TTL_EXPIRED"))
+                        reportResultSafely(client, serverUrl, token, job.jobId, "failed", "TTL_EXPIRED")
                     } else {
                         val outcome = smsSender.sendSms(
                             jobId = job.jobId,
                             toE164 = job.to,
                             body = job.body,
                             simSlot = jobSlot,
-                            mockMode = store.isMockMode()
+                            mockMode = store.isMockMode(),
+                            requestDeliveryReceipts = requestReceipts
                         )
 
+                        // Persist local terminal outcome BEFORE reporting to server so network interruptions never cause duplicate sends or ACCEPTED deadlocks
                         when (outcome) {
                             is SmsDispatchOutcome.SentToNetwork -> {
-                                client.reportResult(serverUrl, token, job.jobId, "sent_to_network")
                                 journal.upsert(JournalEntry(job.jobId, masked, jobSlot, LocalJobState.SENT_TO_NETWORK))
                                 store.incrementTotalDispatched()
                                 dispatchedNow++
+                                reportResultSafely(client, serverUrl, token, job.jobId, "sent_to_network")
                             }
                             is SmsDispatchOutcome.DeliveryUnknown -> {
-                                client.reportResult(serverUrl, token, job.jobId, "delivery_unknown", "AMBIGUOUS_SEND_STATE")
                                 journal.upsert(
                                     JournalEntry(job.jobId, masked, jobSlot, LocalJobState.DELIVERY_UNKNOWN, "AMBIGUOUS_SEND_STATE")
                                 )
+                                reportResultSafely(
+                                    client,
+                                    serverUrl,
+                                    token,
+                                    job.jobId,
+                                    "delivery_unknown",
+                                    "AMBIGUOUS_SEND_STATE"
+                                )
                             }
                             is SmsDispatchOutcome.Failed -> {
-                                client.reportResult(serverUrl, token, job.jobId, "failed", outcome.errorCode)
                                 journal.upsert(
                                     JournalEntry(job.jobId, masked, jobSlot, LocalJobState.FAILED, outcome.errorCode)
+                                )
+                                reportResultSafely(client, serverUrl, token, job.jobId, "failed", outcome.errorCode)
+                            }
+                        }
+                    }
+                } else {
+                    // Re-leased job after prior /result network interruption: re-sync cached outcome without re-sending SMS
+                    when (existing.state) {
+                        LocalJobState.DELIVERED -> {
+                            reportDeliverySafely(client, serverUrl, token, job.jobId)
+                        }
+                        LocalJobState.SENT_TO_NETWORK -> {
+                            reportResultSafely(client, serverUrl, token, job.jobId, "sent_to_network")
+                        }
+                        LocalJobState.DELIVERY_UNKNOWN -> {
+                            reportResultSafely(
+                                client,
+                                serverUrl,
+                                token,
+                                job.jobId,
+                                "delivery_unknown",
+                                existing.errorCode ?: "AMBIGUOUS_SEND_STATE"
+                            )
+                        }
+                        LocalJobState.FAILED -> {
+                            reportResultSafely(
+                                client,
+                                serverUrl,
+                                token,
+                                job.jobId,
+                                "failed",
+                                existing.errorCode ?: "SEND_FAILED"
+                            )
+                        }
+                        LocalJobState.ACCEPTED, LocalJobState.RECEIVED -> {
+                            if (System.currentTimeMillis() - existing.updatedAtEpochMs > STALE_ACCEPTED_TIMEOUT_MS) {
+                                journal.upsert(
+                                    existing.copy(
+                                        state = LocalJobState.DELIVERY_UNKNOWN,
+                                        errorCode = "PROCESS_INTERRUPTED",
+                                        updatedAtEpochMs = System.currentTimeMillis()
+                                    )
+                                )
+                                reportResultSafely(
+                                    client,
+                                    serverUrl,
+                                    token,
+                                    job.jobId,
+                                    "delivery_unknown",
+                                    "PROCESS_INTERRUPTED"
                                 )
                             }
                         }

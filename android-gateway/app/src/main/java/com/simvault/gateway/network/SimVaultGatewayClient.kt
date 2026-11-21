@@ -249,7 +249,7 @@ class SimVaultGatewayClient {
         }
     }
 
-    fun ackAccepted(serverUrl: String, deviceToken: String, jobId: String) {
+    fun ackAccepted(serverUrl: String, deviceToken: String, jobId: String) = executeWithSocketRecovery {
         val baseUrl = requireHttps(serverUrl)
         val req = Request.Builder()
             .url("$baseUrl/v1/gateway/jobs/$jobId/accepted")
@@ -315,10 +315,10 @@ class SimVaultGatewayClient {
 
         private val sharedHttpClient: OkHttpClient = OkHttpClient.Builder()
             .dns(resilientDns)
-            .connectTimeout(5, TimeUnit.SECONDS)
-            .readTimeout(8, TimeUnit.SECONDS)
-            .writeTimeout(6, TimeUnit.SECONDS)
-            .callTimeout(14, TimeUnit.SECONDS)
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(12, TimeUnit.SECONDS)
+            .writeTimeout(8, TimeUnit.SECONDS)
+            .callTimeout(20, TimeUnit.SECONDS)
             .pingInterval(15, TimeUnit.SECONDS)
             .connectionPool(ConnectionPool(2, 45, TimeUnit.SECONDS))
             .retryOnConnectionFailure(true)

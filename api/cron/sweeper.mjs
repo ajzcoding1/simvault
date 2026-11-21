@@ -383,8 +383,8 @@ var init_smsRules = __esm({
     ALLOWED_TRANSITIONS = {
       created: ["queued", "failed", "expired"],
       queued: ["leased", "expired", "failed"],
-      leased: ["accepted_by_device", "queued", "sent_to_network", "delivery_unknown", "failed", "expired"],
-      accepted_by_device: ["sent_to_network", "delivery_unknown", "failed", "expired"],
+      leased: ["accepted_by_device", "queued", "sent_to_network", "delivered", "delivery_unknown", "failed", "expired"],
+      accepted_by_device: ["sent_to_network", "delivered", "delivery_unknown", "failed", "expired"],
       sent_to_network: ["delivered", "delivery_unknown", "failed"],
       delivered: [],
       delivery_unknown: ["delivered", "failed"],
@@ -816,7 +816,7 @@ async function seedInitialData(db) {
     ["otp_resend_cooldown_seconds", "45"],
     ["rate_limit_per_number_hourly", "6"],
     ["rate_limit_per_ip_minute", "30"],
-    ["lease_timeout_seconds", "30"],
+    ["lease_timeout_seconds", "60"],
     ["max_send_retries", "3"],
     ["retention_days", "30"],
     ["global_daily_sim_cap", "300"]
@@ -840,7 +840,16 @@ async function seedInitialData(db) {
     "Customer Account Portal",
     "live",
     "active",
-    JSON.stringify(["login", "signup", "mfa", "password_reset", "security_alert", "account_transactional"]),
+    JSON.stringify([
+      "login",
+      "signup",
+      "mfa",
+      "password_reset",
+      "security_alert",
+      "account_transactional",
+      "personal_message",
+      "bulk_broadcast"
+    ]),
     250,
     0,
     isoNow
@@ -2333,7 +2342,8 @@ async function leaseNextGatewayJob(db, deviceId, preloadedDevice) {
   if (!queuedPeek) {
     return null;
   }
-  const leaseTimeoutSec = Number(settings.lease_timeout_seconds ?? 30);
+  const rawLeaseSec = Number(settings.lease_timeout_seconds ?? 60);
+  const leaseTimeoutSec = Math.max(Number.isFinite(rawLeaseSec) ? rawLeaseSec : 60, 45);
   const leaseExpiresAt = new Date(now.getTime() + leaseTimeoutSec * 1e3).toISOString();
   return db.transaction(async (tx) => {
     const candidateSql = tx.dialect === "postgres" ? `SELECT id, destination_encrypted, body_encrypted, is_test, ttl_expires_at
@@ -2348,6 +2358,20 @@ async function leaseNextGatewayJob(db, deviceId, preloadedDevice) {
            LIMIT 1`;
     const candidate = await tx.get(candidateSql, nowIso);
     if (!candidate) {
+      return null;
+    }
+    let decryptedTo;
+    let decryptedBody;
+    try {
+      decryptedTo = decryptField(candidate.destination_encrypted);
+      decryptedBody = decryptField(candidate.body_encrypted);
+    } catch {
+      await tx.run(
+        "UPDATE messages SET status = 'failed', failed_at = ?, error_code = 'DECRYPT_ERROR' WHERE id = ?",
+        nowIso,
+        candidate.id
+      );
+      await tx.run("DELETE FROM gateway_job_leases WHERE message_id = ?", candidate.id);
       return null;
     }
     const existingAttempts = await tx.get(
@@ -2374,8 +2398,8 @@ async function leaseNextGatewayJob(db, deviceId, preloadedDevice) {
     return {
       job_id: candidate.id,
       lease_token: leaseToken,
-      to: decryptField(candidate.destination_encrypted),
-      body: decryptField(candidate.body_encrypted),
+      to: decryptedTo,
+      body: decryptedBody,
       sim_slot: sim?.slot_index ?? 0,
       is_test: Boolean(candidate.is_test),
       expires_at: candidate.ttl_expires_at
@@ -2404,7 +2428,7 @@ async function reportJobResult(db, deviceId, jobId, outcome, errorCode) {
   if (!msg || msg.device_id !== deviceId) {
     throw new AppError(404, "JOB_NOT_FOUND", "Job not found for this device.");
   }
-  if (msg.status === outcome || msg.status === "delivered" && outcome === "sent_to_network") {
+  if (msg.status === outcome || msg.status === "delivered") {
     return { status: msg.status };
   }
   if (!isValidMessageTransition(msg.status, outcome)) {
@@ -2499,24 +2523,74 @@ async function reportJobResult(db, deviceId, jobId, outcome, errorCode) {
   return { status: outcome };
 }
 async function reportDeliveryReceipt(db, deviceId, jobId) {
-  const msg = await db.get("SELECT id, application_id, device_id, status, destination_masked FROM messages WHERE id = ?", jobId);
+  const msg = await db.get(
+    "SELECT id, application_id, device_id, status, is_test, sent_at, destination_masked FROM messages WHERE id = ?",
+    jobId
+  );
   if (!msg || msg.device_id !== deviceId) {
     throw new AppError(404, "JOB_NOT_FOUND", "Job not found for this device.");
+  }
+  if (msg.status === "delivered") {
+    return { status: "delivered" };
   }
   if (!isValidMessageTransition(msg.status, "delivered")) {
     throw new AppError(409, "INVALID_TRANSITION", `Cannot transition from ${msg.status} to delivered.`);
   }
   const nowIso = (/* @__PURE__ */ new Date()).toISOString();
-  await db.run("UPDATE messages SET status = 'delivered', delivered_at = ?, error_code = NULL WHERE id = ?", nowIso, jobId);
-  await db.run(
-    `INSERT INTO usage_events (id, application_id, device_id, message_id, event_type, units, occurred_at)
-     VALUES (?, ?, ?, ?, 'message.delivered', 1, ?)`,
-    crypto3.randomUUID(),
-    msg.application_id,
-    deviceId,
-    jobId,
-    nowIso
-  );
+  await db.transaction(async (tx) => {
+    const existingSentEvent = await tx.get(
+      "SELECT id FROM usage_events WHERE message_id = ? AND event_type = 'message.sent_to_network' LIMIT 1",
+      jobId
+    );
+    if (!existingSentEvent) {
+      const requestedUsage = await tx.get(
+        "SELECT units FROM usage_events WHERE message_id = ? AND event_type = 'message.requested' LIMIT 1",
+        jobId
+      );
+      const sentUnits = Math.max(1, Number(requestedUsage?.units ?? 1));
+      await tx.run(
+        `INSERT INTO usage_events (id, application_id, device_id, message_id, event_type, units, occurred_at)
+         VALUES (?, ?, ?, ?, 'message.sent_to_network', ?, ?)`,
+        crypto3.randomUUID(),
+        msg.application_id,
+        deviceId,
+        jobId,
+        sentUnits,
+        nowIso
+      );
+      if (!msg.is_test) {
+        await tx.run(
+          `UPDATE sims
+           SET estimated_sms_sent = estimated_sms_sent + ?,
+               estimated_sms_remaining = CASE WHEN estimated_sms_remaining > ? THEN estimated_sms_remaining - ? ELSE 0 END,
+               updated_at = ?
+           WHERE device_id = ?`,
+          sentUnits,
+          sentUnits,
+          sentUnits,
+          nowIso,
+          deviceId
+        );
+      }
+      await tx.run("UPDATE otp_challenges SET status = 'sent' WHERE message_id = ? AND status = 'queued'", jobId);
+    }
+    await tx.run(
+      "UPDATE messages SET status = 'delivered', sent_at = COALESCE(sent_at, ?), delivered_at = ?, error_code = NULL WHERE id = ?",
+      nowIso,
+      nowIso,
+      jobId
+    );
+    await tx.run(
+      `INSERT INTO usage_events (id, application_id, device_id, message_id, event_type, units, occurred_at)
+       VALUES (?, ?, ?, ?, 'message.delivered', 1, ?)`,
+      crypto3.randomUUID(),
+      msg.application_id,
+      deviceId,
+      jobId,
+      nowIso
+    );
+    await tx.run("DELETE FROM gateway_job_leases WHERE message_id = ?", jobId);
+  });
   await enqueueWebhookEvent(db, msg.application_id, "message.status", {
     message_id: msg.id,
     status: "delivered",

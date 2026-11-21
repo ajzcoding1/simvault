@@ -9,7 +9,7 @@ interface SettingsAndInfraViewProps {
 
 export function SettingsAndInfraView({ settings, onUpdated }: SettingsAndInfraViewProps) {
   const [globalPaused, setGlobalPaused] = useState(settings.global_paused === 'true');
-  const [leaseTimeout, setLeaseTimeout] = useState(settings.lease_timeout_seconds || '30');
+  const [leaseTimeout, setLeaseTimeout] = useState(settings.lease_timeout_seconds || '60');
   const [maxRetries, setMaxRetries] = useState(settings.max_send_retries || '3');
   const [retentionDays, setRetentionDays] = useState(settings.retention_days || '30');
   const [sweeperResult, setSweeperResult] = useState<string | null>(null);
@@ -19,7 +19,7 @@ export function SettingsAndInfraView({ settings, onUpdated }: SettingsAndInfraVi
 
   useEffect(() => {
     setGlobalPaused(settings.global_paused === 'true');
-    setLeaseTimeout(settings.lease_timeout_seconds || '30');
+    setLeaseTimeout(settings.lease_timeout_seconds || '60');
     setMaxRetries(settings.max_send_retries || '3');
     setRetentionDays(settings.retention_days || '30');
   }, [settings]);

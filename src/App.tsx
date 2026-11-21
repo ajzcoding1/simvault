@@ -110,6 +110,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [sendModalOpen, setSendModalOpen] = useState(false);
   const [refreshSignal, setRefreshSignal] = useState(0);
+  const [backgroundTick, setBackgroundTick] = useState(0);
 
   // Auth lock state (fail-closed until server confirms active session)
   const [authChecked, setAuthChecked] = useState(false);
@@ -211,6 +212,7 @@ export default function App() {
     if (!authenticated) return;
     const timer = setInterval(() => {
       void loadCoreData();
+      setBackgroundTick((t) => t + 1);
     }, 6000);
     return () => clearInterval(timer);
   }, [authenticated, loadCoreData]);
@@ -495,14 +497,19 @@ export default function App() {
           {section === 'messages' && (
             <MessagesView
               applications={applications}
+              overview={overview}
               onOpenSendModal={() => setSendModalOpen(true)}
+              onNavigateToDevices={() => navigateTo('gateway-devices')}
               refreshSignal={refreshSignal}
+              backgroundTick={backgroundTick}
             />
           )}
           {section === 'otp-challenges' && (
             <OtpChallengesView applications={applications} onDataChanged={triggerRefresh} />
           )}
-          {section === 'gateway-devices' && <GatewayDevicesView onDataChanged={triggerRefresh} />}
+          {section === 'gateway-devices' && (
+            <GatewayDevicesView backgroundTick={backgroundTick} onDataChanged={triggerRefresh} />
+          )}
           {section === 'sim-usage' && <SimUsageView onDataChanged={triggerRefresh} />}
           {section === 'templates' && <TemplatesView />}
           {section === 'webhooks' && <WebhooksView applications={applications} />}

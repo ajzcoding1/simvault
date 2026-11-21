@@ -13,10 +13,11 @@ interface EnrollmentTokenRow {
 }
 
 interface GatewayDevicesViewProps {
+  backgroundTick?: number;
   onDataChanged: () => void;
 }
 
-export function GatewayDevicesView({ onDataChanged }: GatewayDevicesViewProps) {
+export function GatewayDevicesView({ backgroundTick = 0, onDataChanged }: GatewayDevicesViewProps) {
   const [devices, setDevices] = useState<GatewayDevice[]>([]);
   const [tokens, setTokens] = useState<EnrollmentTokenRow[]>([]);
   const [sims, setSims] = useState<SimRecord[]>([]);
@@ -35,8 +36,8 @@ export function GatewayDevicesView({ onDataChanged }: GatewayDevicesViewProps) {
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
   const [showAndroidProject, setShowAndroidProject] = useState(false);
 
-  const loadDevices = async () => {
-    setLoading(true);
+  const loadDevices = async (silent = false) => {
+    if (!silent) setLoading(true);
     setErrorMsg(null);
     try {
       const res = await apiRequest<{
@@ -52,12 +53,12 @@ export function GatewayDevicesView({ onDataChanged }: GatewayDevicesViewProps) {
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to load gateway devices');
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
   useEffect(() => {
-    void loadDevices();
+    void loadDevices(false);
     apiRequest<{ files: Array<{ path: string; content: string }> }>('/api/admin/android-project')
       .then((res) => {
         setAndroidFiles(res.files);
@@ -65,6 +66,11 @@ export function GatewayDevicesView({ onDataChanged }: GatewayDevicesViewProps) {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (backgroundTick === 0) return;
+    void loadDevices(true);
+  }, [backgroundTick]);
 
   const handleCreateToken = async (e: FormEvent) => {
     e.preventDefault();

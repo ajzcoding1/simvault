@@ -42,7 +42,9 @@ test('template rendering substitutes variables and reports missing ones', () => 
 test('message state machine enforces truthful lifecycle transitions', () => {
   assert.equal(isValidMessageTransition('queued', 'leased'), true);
   assert.equal(isValidMessageTransition('leased', 'accepted_by_device'), true);
+  assert.equal(isValidMessageTransition('leased', 'delivered'), true);
   assert.equal(isValidMessageTransition('accepted_by_device', 'sent_to_network'), true);
+  assert.equal(isValidMessageTransition('accepted_by_device', 'delivered'), true);
   assert.equal(isValidMessageTransition('sent_to_network', 'delivered'), true);
   assert.equal(isValidMessageTransition('sent_to_network', 'delivery_unknown'), true);
   assert.equal(isValidMessageTransition('queued', 'delivered'), false);

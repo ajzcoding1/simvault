@@ -13,8 +13,10 @@ class SmsDeliveryReceiver : BroadcastReceiver() {
         if (intent.action != ACTION_SMS_DELIVERED) return
         val jobId = intent.getStringExtra(EXTRA_JOB_ID)?.takeIf { it.isNotBlank() } ?: return
         if (resultCode == Activity.RESULT_OK) {
-            LocalJobJournal(context).updateDeliveryReceipt(jobId)
-            DeliveryReportWorker.enqueue(context, jobId)
+            val shouldNotifyServer = LocalJobJournal(context).updateDeliveryReceipt(jobId)
+            if (shouldNotifyServer) {
+                DeliveryReportWorker.enqueue(context, jobId)
+            }
         }
     }
 

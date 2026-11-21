@@ -522,7 +522,10 @@ export function createAdminRouter(db: DbClient): Router {
       const rawPurposes = Array.isArray(allowed_purposes)
         ? allowed_purposes.filter((p): p is string => typeof p === 'string' && (VALID_MESSAGE_PURPOSES as readonly string[]).includes(p))
         : [];
-      const purposes = rawPurposes.length > 0 ? rawPurposes : ['login', 'mfa', 'account_transactional'];
+      const purposes =
+        rawPurposes.length > 0
+          ? rawPurposes
+          : ['login', 'mfa', 'account_transactional', 'personal_message', 'bulk_broadcast'];
 
       await db.run(
         `INSERT INTO applications (id, owner_user_id, name, environment, status, allowed_purposes_json, daily_limit, allowlist_only, created_at)

@@ -933,6 +933,122 @@ test('Security hardening: type confusion rejection, TOTP replay protection, MFA 
   }
 });
 
+test('Delivery lifecycle: multipart duplicate delivery receipts, out-of-order receipt before /result, and minimum lease headroom work reliably', async () => {
+  const db = await createIsolatedTestDb();
+
+  await withServer(db, async (baseUrl) => {
+    const loginRes = await fetch(`${baseUrl}/api/admin/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'owner@simvault.local', password: 'SimVault!2026' }),
+    });
+    const cookieHeader = (loginRes.headers.get('set-cookie') ?? '').split(';')[0];
+    const loginBody = (await loginRes.json()) as { csrf_token: string };
+
+    const tokenRes = await fetch(`${baseUrl}/api/admin/devices/enrollment-tokens`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookieHeader,
+        'X-CSRF-Token': loginBody.csrf_token,
+      },
+      body: JSON.stringify({ device_name: 'OnePlus Delivery Test', ttl_minutes: 15 }),
+    });
+    const { enrollment_token_once } = (await tokenRes.json()) as { enrollment_token_once: string };
+
+    const enrollRes = await fetch(`${baseUrl}/v1/gateway/enroll`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enrollment_token: enrollment_token_once,
+        device_name: 'OnePlus Delivery Test',
+        app_version: '1.3.2',
+        android_version: '15 (API 35)',
+      }),
+    });
+    const enrolled = (await enrollRes.json()) as { device_id: string; device_token: string };
+
+    await fetch(`${baseUrl}/v1/gateway/heartbeat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${enrolled.device_token}`,
+      },
+      body: JSON.stringify({
+        app_version: '1.3.2',
+        permission_send_sms: true,
+        sim_ready: true,
+        sim_slot: 0,
+      }),
+    });
+
+    // 1. Out-of-order delivery receipt arriving directly from leased -> delivered
+    const msg1 = await createSmsRequest(db, {
+      applicationId: 'app_portal_prod',
+      to: '+919876543210',
+      templateCode: 'login_notice',
+      variables: { name: 'User1', device_label: 'Phone' },
+      purpose: 'account_transactional',
+      actorId: 'test',
+    });
+
+    const poll1 = await fetch(`${baseUrl}/v1/gateway/poll`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${enrolled.device_token}` },
+      body: '{}',
+    });
+    const poll1Json = (await poll1.json()) as { job: { job_id: string } | null };
+    assert.equal(poll1Json.job?.job_id, msg1.message_id);
+
+    const dlr1 = await fetch(`${baseUrl}/v1/gateway/jobs/${msg1.message_id}/delivery-report`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${enrolled.device_token}` },
+      body: '{}',
+    });
+    assert.equal(dlr1.status, 200);
+    assert.equal(((await dlr1.json()) as { status: string }).status, 'delivered');
+
+    // Duplicate multipart delivery receipt returns 200 idempotently (not 409)
+    const dlr1Dup = await fetch(`${baseUrl}/v1/gateway/jobs/${msg1.message_id}/delivery-report`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${enrolled.device_token}` },
+      body: '{}',
+    });
+    assert.equal(dlr1Dup.status, 200);
+    assert.equal(((await dlr1Dup.json()) as { status: string }).status, 'delivered');
+
+    // Late /result report after delivery receipt must also return 200 delivered without reverting status
+    const lateResult = await fetch(`${baseUrl}/v1/gateway/jobs/${msg1.message_id}/result`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${enrolled.device_token}` },
+      body: JSON.stringify({ status: 'delivery_unknown', error_code: 'AMBIGUOUS_SEND_STATE' }),
+    });
+    assert.equal(lateResult.status, 200);
+    assert.equal(((await lateResult.json()) as { status: string }).status, 'delivered');
+
+    const row1 = (await db.get<{ status: string; sent_at: string | null; delivered_at: string | null }>(
+      'SELECT status, sent_at, delivered_at FROM messages WHERE id = ?',
+      msg1.message_id
+    ))!;
+    assert.equal(row1.status, 'delivered');
+    assert.ok(row1.sent_at);
+    assert.ok(row1.delivered_at);
+
+    const leaseCount = Number(
+      (await db.get<{ c: number }>('SELECT COUNT(*) as c FROM gateway_job_leases WHERE message_id = ?', msg1.message_id))?.c ?? 0
+    );
+    assert.equal(leaseCount, 0);
+
+    const simRow = (await db.get<{ estimated_sms_sent: number; estimated_sms_remaining: number }>(
+      'SELECT estimated_sms_sent, estimated_sms_remaining FROM sims WHERE device_id = ?',
+      enrolled.device_id
+    ))!;
+    assert.equal(simRow.estimated_sms_sent, 1);
+    assert.equal(simRow.estimated_sms_remaining, 2999);
+  });
+});
+
+
 
 
 

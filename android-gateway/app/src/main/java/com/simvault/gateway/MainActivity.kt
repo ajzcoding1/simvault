@@ -286,6 +286,7 @@ fun GatewayConsoleScreen(
     var mockMode by remember { mutableStateOf(store.isMockMode()) }
     var autoPoll by remember { mutableStateOf(store.isAutoPollEnabled()) }
     var bgServiceEnabled by remember { mutableStateOf(store.isBackgroundServiceEnabled()) }
+    var requestReceipts by remember { mutableStateOf(store.isDeliveryReceiptRequested()) }
     var selectedSlot by remember { mutableIntStateOf(store.getSelectedSimSlot()) }
     var lastHeartbeat by remember { mutableStateOf(store.getLastHeartbeat()) }
     var serverStatus by remember { mutableStateOf(store.getServerStatus()) }
@@ -766,6 +767,28 @@ fun GatewayConsoleScreen(
                                     }
                                 )
                             }
+
+                            Row(
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Carrier Delivery Receipts", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                                    Text(
+                                        "Auto-falls back if carrier rejects delivery report requests",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Switch(
+                                    checked = requestReceipts,
+                                    onCheckedChange = {
+                                        requestReceipts = it
+                                        store.setDeliveryReceiptRequested(it)
+                                    }
+                                )
+                            }
                         }
                     }
                 }
@@ -849,9 +872,13 @@ fun GatewayConsoleScreen(
 
                         if (sims.isEmpty()) {
                             Text(
-                                "No active SIM detected (or READ_PHONE_STATE permission not granted).",
+                                if (hasSmsPerm && sender.hasSimHardwareReady()) {
+                                    "SEND_SMS granted · using default system SIM (grant PHONE permission to choose SIM slot)."
+                                } else {
+                                    "No active SIM detected (or SEND_SMS / READ_PHONE_STATE permission not granted)."
+                                },
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                color = if (hasSmsPerm && sender.hasSimHardwareReady()) emeraldFg else MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         } else {
                             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
