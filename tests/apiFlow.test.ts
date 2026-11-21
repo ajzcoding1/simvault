@@ -413,3 +413,118 @@ test('resolvePostgresUrl supports SUPABASE_DB_URL, quote stripping, POSTGRES_URL
   );
 });
 
+test('POST /v1/gateway/poll handles telemetry, single-round-trip lease, idle write skip, and direct leased -> sent_to_network completion', async () => {
+  const db = await createIsolatedTestDb();
+
+  await withServer(db, async (baseUrl) => {
+    const loginRes = await fetch(`${baseUrl}/api/admin/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'owner@simvault.local', password: 'SimVault!2026' }),
+    });
+    const cookieHeader = (loginRes.headers.get('set-cookie') ?? '').split(';')[0];
+    const loginBody = (await loginRes.json()) as { csrf_token: string };
+
+    const tokenRes = await fetch(`${baseUrl}/api/admin/devices/enrollment-tokens`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookieHeader,
+        'X-CSRF-Token': loginBody.csrf_token,
+      },
+      body: JSON.stringify({ device_name: 'OnePlus Fast', ttl_minutes: 15 }),
+    });
+    const { enrollment_token_once } = (await tokenRes.json()) as { enrollment_token_once: string };
+
+    const enrollRes = await fetch(`${baseUrl}/v1/gateway/enroll`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enrollment_token: enrollment_token_once,
+        device_name: 'OnePlus Fast',
+        app_version: '1.3.1',
+        android_version: '14 (API 34)',
+      }),
+    });
+    const enrolled = (await enrollRes.json()) as { device_id: string; device_token: string };
+
+    // 1. Combined poll with telemetry while queue is empty
+    const poll1 = await fetch(`${baseUrl}/v1/gateway/poll`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${enrolled.device_token}`,
+      },
+      body: JSON.stringify({
+        app_version: '1.3.1',
+        android_version: '14 (API 34)',
+        permission_send_sms: true,
+        network_type: 'Wi-Fi',
+        battery_pct: 92,
+        sim_ready: true,
+        sim_slot: 0,
+        carrier_label: 'Airtel 5G',
+        masked_msisdn: '+91••••••9988',
+      }),
+    });
+    assert.equal(poll1.status, 200);
+    const poll1Json = (await poll1.json()) as { device_id: string; status: string; job: null | { job_id: string } };
+    assert.equal(poll1Json.device_id, enrolled.device_id);
+    assert.equal(poll1Json.status, 'online');
+    assert.equal(poll1Json.job, null);
+
+    const hbBeforeRow = (await db.get<{ last_heartbeat_at: string }>(
+      'SELECT last_heartbeat_at FROM gateway_devices WHERE id = ?',
+      enrolled.device_id
+    ))!;
+
+    // 2. Queue an SMS and fetch it in 1 round-trip via lightweight /v1/gateway/poll ({})
+    const sms = await createSmsRequest(db, {
+      applicationId: 'app_portal_prod',
+      to: '+919876543210',
+      templateCode: 'login_notice',
+      variables: { name: 'Owner', device_label: 'OnePlus' },
+      purpose: 'account_transactional',
+      actorId: 'test',
+    });
+
+    const poll2 = await fetch(`${baseUrl}/v1/gateway/poll`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${enrolled.device_token}`,
+      },
+      body: '{}',
+    });
+    assert.equal(poll2.status, 200);
+    const poll2Json = (await poll2.json()) as {
+      status: string;
+      job: { job_id: string; to: string; body: string; sim_slot: number } | null;
+    };
+    assert.ok(poll2Json.job);
+    assert.equal(poll2Json.job.job_id, sms.message_id);
+
+    // Lightweight steady-state poll within 15s should skip rewriting last_heartbeat_at
+    const hbAfterRow = (await db.get<{ last_heartbeat_at: string }>(
+      'SELECT last_heartbeat_at FROM gateway_devices WHERE id = ?',
+      enrolled.device_id
+    ))!;
+    assert.equal(hbAfterRow.last_heartbeat_at, hbBeforeRow.last_heartbeat_at);
+
+    // 3. Report result directly from leased -> sent_to_network without calling /accepted
+    const resReport = await fetch(`${baseUrl}/v1/gateway/jobs/${sms.message_id}/result`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${enrolled.device_token}`,
+      },
+      body: JSON.stringify({ status: 'sent_to_network' }),
+    });
+    assert.equal(resReport.status, 200);
+
+    const msgRow = (await db.get<{ status: string }>('SELECT status FROM messages WHERE id = ?', sms.message_id))!;
+    assert.equal(msgRow.status, 'sent_to_network');
+  });
+});
+
+

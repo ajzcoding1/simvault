@@ -49,7 +49,7 @@ class GatewayForegroundService : Service() {
             return START_NOT_STICKY
         }
 
-        val initialNote = buildNotification("Starting live 5s OTP poll...")
+        val initialNote = buildNotification("Starting live 2.5s OTP poll...")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, initialNote, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
@@ -75,10 +75,14 @@ class GatewayForegroundService : Service() {
 
                 when (val outcome = GatewayPollEngine.runPollCycle(applicationContext)) {
                     is PollCycleOutcome.Success -> {
-                        backoffMs = if (store.isPaused() || outcome.serverStatus == "paused") 15_000L else BASE_POLL_INTERVAL_MS
+                        backoffMs = when {
+                            store.isPaused() || outcome.serverStatus == "paused" -> 15_000L
+                            outcome.hasMoreLikely -> BATCH_CONTINUE_DELAY_MS
+                            else -> BASE_POLL_INTERVAL_MS
+                        }
                         val modeLabel = if (store.isPaused()) "Paused locally"
-                        else if (store.isMockMode()) "Mock mode · 5s poll"
-                        else "Online · 5s OTP poll"
+                        else if (store.isMockMode()) "Mock mode · 2.5s poll"
+                        else "Online · 2.5s OTP poll"
                         updateNotification("$modeLabel · Sent: ${store.getTotalDispatchedCount()}")
                     }
                     is PollCycleOutcome.AuthRevoked -> {
@@ -155,7 +159,8 @@ class GatewayForegroundService : Service() {
     companion object {
         private const val CHANNEL_ID = "simvault_gateway_channel"
         private const val NOTIFICATION_ID = 4109
-        private const val BASE_POLL_INTERVAL_MS = 5_000L
+        private const val BASE_POLL_INTERVAL_MS = 2_500L
+        private const val BATCH_CONTINUE_DELAY_MS = 150L
         private const val MAX_BACKOFF_MS = 30_000L
         private const val ACTION_STOP = "com.simvault.gateway.action.STOP_SERVICE"
 

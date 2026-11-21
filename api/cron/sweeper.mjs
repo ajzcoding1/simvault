@@ -470,12 +470,37 @@ async function getDb(dbPath) {
         });
         const pgClient = new PostgresDbClient(pool);
         try {
-          await pgClient.transaction(async (tx) => {
-            await tx.exec("SELECT pg_advisory_xact_lock(84729103);");
-            await migrateSchema(tx);
-            await seedInitialData(tx);
-            await syncEnvAdminCredentials(tx);
-          });
+          let fastPathReady = false;
+          const regCheck = await pgClient.get(
+            "SELECT to_regclass('public.platform_settings') AS ps, to_regclass('public.gateway_job_leases') AS gl"
+          );
+          if (regCheck?.ps && regCheck?.gl) {
+            const stateCheck = await pgClient.get(
+              `SELECT
+                 (SELECT value FROM platform_settings WHERE key = 'migration_live_mode_v2') AS migrated,
+                 (SELECT value FROM platform_settings WHERE key = 'env_admin_sync_sig') AS admin_sig,
+                 (SELECT 1 FROM users LIMIT 1) AS has_user`
+            );
+            if (stateCheck?.migrated === "done" && Number(stateCheck?.has_user ?? 0) === 1) {
+              const rawEmail = process.env.SIMVAULT_ADMIN_EMAIL?.trim().toLowerCase() ?? "";
+              const rawPassword = process.env.SIMVAULT_ADMIN_PASSWORD?.trim() ?? "";
+              if (rawEmail || rawPassword) {
+                const expectedSig = crypto2.createHash("sha256").update(`${rawEmail}:${rawPassword}`).digest("hex");
+                if (stateCheck.admin_sig !== expectedSig) {
+                  await syncEnvAdminCredentials(pgClient);
+                }
+              }
+              fastPathReady = true;
+            }
+          }
+          if (!fastPathReady) {
+            await pgClient.transaction(async (tx) => {
+              await tx.exec("SELECT pg_advisory_xact_lock(84729103);");
+              await migrateSchema(tx);
+              await seedInitialData(tx);
+              await syncEnvAdminCredentials(tx);
+            });
+          }
           return pgClient;
         } catch (err) {
           await pool.end().catch(() => void 0);
@@ -1168,6 +1193,8 @@ __export(services_exports, {
   leaseNextGatewayJob: () => leaseNextGatewayJob,
   markJobAcceptedByDevice: () => markJobAcceptedByDevice,
   maybeRunOpportunisticSweep: () => maybeRunOpportunisticSweep,
+  maybeRunQueueMaintenance: () => maybeRunQueueMaintenance,
+  recordGatewayHeartbeat: () => recordGatewayHeartbeat,
   recordLoginFailure: () => recordLoginFailure,
   reportDeliveryReceipt: () => reportDeliveryReceipt,
   reportJobResult: () => reportJobResult,
@@ -1725,7 +1752,7 @@ async function verifyOtpChallenge(db, input) {
 async function authenticateGatewayDevice(db, rawToken) {
   const tokenHash = hashToken(rawToken);
   const dev = await db.get(
-    `SELECT id, name, status, permission_send_sms, sim_ready, revoked_at
+    `SELECT id, name, status, permission_send_sms, sim_ready, last_heartbeat_at, revoked_at
      FROM gateway_devices WHERE device_token_hash = ?`,
     tokenHash
   );
@@ -1737,24 +1764,123 @@ async function authenticateGatewayDevice(db, rawToken) {
     name: dev.name,
     status: dev.status,
     permissionSendSms: Boolean(dev.permission_send_sms),
-    simReady: Boolean(dev.sim_ready)
+    simReady: Boolean(dev.sim_ready),
+    lastHeartbeatAt: dev.last_heartbeat_at ?? null
   };
 }
-async function leaseNextGatewayJob(db, deviceId) {
-  await maybeRunOpportunisticSweep(db);
-  const settings = await getSettingsMap(db);
+async function recordGatewayHeartbeat(db, dev, body, now = /* @__PURE__ */ new Date()) {
+  const {
+    app_version,
+    android_version,
+    permission_send_sms,
+    network_type,
+    battery_pct,
+    sim_ready,
+    sim_slot,
+    carrier_label,
+    masked_msisdn
+  } = body ?? {};
+  const nowIso = now.toISOString();
+  const nextStatus = dev.status === "paused" ? "paused" : "online";
+  const boundedBattery = typeof battery_pct === "number" && Number.isFinite(battery_pct) ? Math.max(0, Math.min(100, Math.round(battery_pct))) : null;
+  await db.run(
+    `UPDATE gateway_devices
+     SET status = ?,
+         app_version = COALESCE(?, app_version),
+         android_version = COALESCE(?, android_version),
+         permission_send_sms = COALESCE(?, permission_send_sms),
+         network_type = COALESCE(?, network_type),
+         battery_pct = COALESCE(?, battery_pct),
+         sim_ready = COALESCE(?, sim_ready),
+         last_heartbeat_at = ?
+     WHERE id = ?`,
+    nextStatus,
+    app_version ? String(app_version).slice(0, 32) : null,
+    android_version ? String(android_version).slice(0, 40) : null,
+    typeof permission_send_sms === "boolean" ? permission_send_sms ? 1 : 0 : null,
+    network_type ? String(network_type).slice(0, 40) : null,
+    boundedBattery,
+    typeof sim_ready === "boolean" ? sim_ready ? 1 : 0 : null,
+    nowIso,
+    dev.id
+  );
+  if (carrier_label || masked_msisdn || typeof sim_slot === "number") {
+    const slotIdx = typeof sim_slot === "number" && Number.isFinite(sim_slot) ? Math.max(0, Math.min(3, Math.trunc(sim_slot))) : 0;
+    const simRow = await db.get(
+      "SELECT id FROM sims WHERE device_id = ? AND slot_index = ?",
+      dev.id,
+      slotIdx
+    );
+    if (simRow) {
+      await db.run(
+        `UPDATE sims
+         SET carrier_label = COALESCE(?, carrier_label),
+             masked_msisdn = COALESCE(?, masked_msisdn),
+             updated_at = ?
+         WHERE id = ?`,
+        carrier_label ? String(carrier_label).slice(0, 64) : null,
+        masked_msisdn ? String(masked_msisdn).slice(0, 32) : null,
+        nowIso,
+        simRow.id
+      );
+    } else {
+      const cycleStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
+      const cycleEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().slice(0, 10);
+      await db.run(
+        `INSERT INTO sims (id, device_id, carrier_label, masked_msisdn, slot_index, plan_sms_limit, period_start, period_end, estimated_sms_sent, estimated_sms_remaining, warning_threshold, notes, updated_at)
+         VALUES (?, ?, ?, ?, ?, 3000, ?, ?, 0, 3000, 300, ?, ?)`,
+        `sim_${dev.id}_${slotIdx}`,
+        dev.id,
+        carrier_label ? String(carrier_label).slice(0, 64) : `SIM Slot ${slotIdx}`,
+        masked_msisdn ? String(masked_msisdn).slice(0, 32) : "Pending telemetry",
+        slotIdx,
+        cycleStart,
+        cycleEnd,
+        "Live SIM \u2014 reconcile monthly against your carrier statement.",
+        nowIso
+      );
+    }
+  }
+  return {
+    device_id: dev.id,
+    status: nextStatus,
+    server_time: nowIso,
+    permissionSendSms: typeof permission_send_sms === "boolean" ? permission_send_sms : dev.permissionSendSms,
+    simReady: typeof sim_ready === "boolean" ? sim_ready : dev.simReady
+  };
+}
+async function leaseNextGatewayJob(db, deviceId, preloadedDevice) {
+  await maybeRunQueueMaintenance(db, 15e3);
+  const settingRows = await db.all(
+    "SELECT key, value FROM platform_settings WHERE key IN ('global_paused', 'lease_timeout_seconds')"
+  );
+  const settings = {};
+  for (const r of settingRows) settings[r.key] = r.value;
   if (settings.global_paused === "true") {
     return null;
   }
-  const dev = await db.get(
-    "SELECT id, status, permission_send_sms, sim_ready FROM gateway_devices WHERE id = ?",
-    deviceId
-  );
-  if (!dev || dev.status !== "online" || !dev.permission_send_sms || !dev.sim_ready) {
-    return null;
+  if (preloadedDevice) {
+    if (preloadedDevice.status !== "online" || !preloadedDevice.permissionSendSms || !preloadedDevice.simReady) {
+      return null;
+    }
+  } else {
+    const dev = await db.get(
+      "SELECT id, status, permission_send_sms, sim_ready FROM gateway_devices WHERE id = ?",
+      deviceId
+    );
+    if (!dev || dev.status !== "online" || !dev.permission_send_sms || !dev.sim_ready) {
+      return null;
+    }
   }
   const now = /* @__PURE__ */ new Date();
   const nowIso = now.toISOString();
+  const queuedPeek = await db.get(
+    "SELECT id FROM messages WHERE status = 'queued' AND ttl_expires_at > ? LIMIT 1",
+    nowIso
+  );
+  if (!queuedPeek) {
+    return null;
+  }
   const leaseTimeoutSec = Number(settings.lease_timeout_seconds ?? 30);
   const leaseExpiresAt = new Date(now.getTime() + leaseTimeoutSec * 1e3).toISOString();
   return db.transaction(async (tx) => {
@@ -1935,11 +2061,13 @@ async function reportDeliveryReceipt(db, deviceId, jobId) {
   });
   return { status: "delivered" };
 }
-async function runSweeperTick(db) {
+async function runQueueMaintenanceTick(db) {
   const now = /* @__PURE__ */ new Date();
   const nowIso = now.toISOString();
-  const settings = await getSettingsMap(db);
-  const maxRetries = Number(settings.max_send_retries ?? 3);
+  const maxRetryRow = await db.get(
+    "SELECT value FROM platform_settings WHERE key = 'max_send_retries'"
+  );
+  const maxRetries = Number(maxRetryRow?.value ?? 3);
   const expiredRows = await db.all(
     `SELECT id, application_id, destination_masked FROM messages
      WHERE status IN ('created', 'queued', 'leased', 'accepted_by_device') AND ttl_expires_at <= ?`,
@@ -1995,6 +2123,16 @@ async function runSweeperTick(db) {
      WHERE status = 'online' AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at < ?`,
     staleHeartbeatCutoff
   );
+  return {
+    expiredMessages: expiredRows.length,
+    requeuedLeases,
+    failedMaxRetries,
+    expiredOtps: Number(expOtps.changes ?? 0)
+  };
+}
+async function runSweeperTick(db) {
+  const maintenance = await runQueueMaintenanceTick(db);
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
   const pendingHooks = await db.all(
     `SELECT d.id, d.event_id, d.payload_redacted_json, d.attempt_count, e.url, e.secret_encrypted
      FROM webhook_deliveries d
@@ -2064,12 +2202,25 @@ async function runSweeperTick(db) {
     await Promise.allSettled(webhookPromises);
   }
   return {
-    expiredMessages: expiredRows.length,
-    requeuedLeases,
-    failedMaxRetries,
-    expiredOtps: Number(expOtps.changes ?? 0),
+    ...maintenance,
     processedWebhooks
   };
+}
+async function maybeRunQueueMaintenance(db, minIntervalMs = 15e3) {
+  const now = Date.now();
+  const lastAt = lastMaintenanceAtByDb.get(db) ?? 0;
+  if (now - lastAt < minIntervalMs) return;
+  const active = inFlightMaintenanceByDb.get(db);
+  if (active) {
+    await active;
+    return;
+  }
+  lastMaintenanceAtByDb.set(db, now);
+  const promise = runQueueMaintenanceTick(db).then(() => void 0).catch(() => void 0).finally(() => {
+    inFlightMaintenanceByDb.delete(db);
+  });
+  inFlightMaintenanceByDb.set(db, promise);
+  await promise;
 }
 async function maybeRunOpportunisticSweep(db, minIntervalMs = 5e3) {
   const now = Date.now();
@@ -2087,7 +2238,7 @@ async function maybeRunOpportunisticSweep(db, minIntervalMs = 5e3) {
   inFlightSweepByDb.set(db, promise);
   await promise;
 }
-var AppError, ipWindow, loginFailureWindow, lastSweepAtByDb, inFlightSweepByDb;
+var AppError, ipWindow, loginFailureWindow, lastMaintenanceAtByDb, inFlightMaintenanceByDb, lastSweepAtByDb, inFlightSweepByDb;
 var init_services = __esm({
   "server/services.ts"() {
     init_crypto();
@@ -2102,6 +2253,8 @@ var init_services = __esm({
     };
     ipWindow = /* @__PURE__ */ new Map();
     loginFailureWindow = /* @__PURE__ */ new Map();
+    lastMaintenanceAtByDb = /* @__PURE__ */ new WeakMap();
+    inFlightMaintenanceByDb = /* @__PURE__ */ new WeakMap();
     lastSweepAtByDb = /* @__PURE__ */ new WeakMap();
     inFlightSweepByDb = /* @__PURE__ */ new WeakMap();
   }

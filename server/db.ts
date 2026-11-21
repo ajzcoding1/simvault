@@ -615,12 +615,44 @@ export async function getDb(dbPath?: string): Promise<DbClient> {
 
         const pgClient = new PostgresDbClient(pool);
         try {
-          await pgClient.transaction(async (tx) => {
-            await tx.exec('SELECT pg_advisory_xact_lock(84729103);');
-            await migrateSchema(tx);
-            await seedInitialData(tx);
-            await syncEnvAdminCredentials(tx);
-          });
+          let fastPathReady = false;
+          const regCheck = await pgClient.get<{ ps: string | null; gl: string | null }>(
+            "SELECT to_regclass('public.platform_settings') AS ps, to_regclass('public.gateway_job_leases') AS gl"
+          );
+
+          if (regCheck?.ps && regCheck?.gl) {
+            const stateCheck = await pgClient.get<{
+              migrated: string | null;
+              admin_sig: string | null;
+              has_user: number | null;
+            }>(
+              `SELECT
+                 (SELECT value FROM platform_settings WHERE key = 'migration_live_mode_v2') AS migrated,
+                 (SELECT value FROM platform_settings WHERE key = 'env_admin_sync_sig') AS admin_sig,
+                 (SELECT 1 FROM users LIMIT 1) AS has_user`
+            );
+
+            if (stateCheck?.migrated === 'done' && Number(stateCheck?.has_user ?? 0) === 1) {
+              const rawEmail = process.env.SIMVAULT_ADMIN_EMAIL?.trim().toLowerCase() ?? '';
+              const rawPassword = process.env.SIMVAULT_ADMIN_PASSWORD?.trim() ?? '';
+              if (rawEmail || rawPassword) {
+                const expectedSig = crypto.createHash('sha256').update(`${rawEmail}:${rawPassword}`).digest('hex');
+                if (stateCheck.admin_sig !== expectedSig) {
+                  await syncEnvAdminCredentials(pgClient);
+                }
+              }
+              fastPathReady = true;
+            }
+          }
+
+          if (!fastPathReady) {
+            await pgClient.transaction(async (tx) => {
+              await tx.exec('SELECT pg_advisory_xact_lock(84729103);');
+              await migrateSchema(tx);
+              await seedInitialData(tx);
+              await syncEnvAdminCredentials(tx);
+            });
+          }
           return pgClient;
         } catch (err) {
           await pool.end().catch(() => undefined);

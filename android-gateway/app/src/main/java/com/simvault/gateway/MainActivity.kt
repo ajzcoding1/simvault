@@ -366,7 +366,7 @@ fun GatewayConsoleScreen(
                 delay(3_000L)
             } else if (autoPoll) {
                 runImmediatePoll(showFeedback = false)
-                delay(8_000L)
+                delay(3_000L)
             } else {
                 refreshLocalState()
                 delay(5_000L)
@@ -698,7 +698,7 @@ fun GatewayConsoleScreen(
                                 modifier = Modifier.fillMaxWidth()
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text("Background Live Service (5s OTP Poll)", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                                    Text("Background Live Service (2.5s OTP Poll)", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
                                     Text(
                                         "Keeps polling when screen is off via persistent notification",
                                         style = MaterialTheme.typography.bodySmall,
@@ -723,7 +723,7 @@ fun GatewayConsoleScreen(
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
                                     Column(modifier = Modifier.weight(1f)) {
-                                        Text("Auto-Poll While Screen Open (8s)", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                                        Text("Auto-Poll While Screen Open (3s)", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
                                         Text(
                                             "WorkManager fallback runs every 15m in background",
                                             style = MaterialTheme.typography.bodySmall,

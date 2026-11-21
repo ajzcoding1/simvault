@@ -2,6 +2,7 @@ package com.simvault.gateway.network
 
 import com.simvault.gateway.data.EnrollmentResult
 import com.simvault.gateway.data.GatewayApiException
+import com.simvault.gateway.data.GatewayPollResult
 import com.simvault.gateway.data.HealthCheckResult
 import com.simvault.gateway.data.HeartbeatResult
 import com.simvault.gateway.data.LeasedJob
@@ -140,6 +141,70 @@ class SimVaultGatewayClient {
         }
     }
 
+    private fun parseLeasedJob(json: JSONObject): LeasedJob {
+        return LeasedJob(
+            jobId = json.getString("job_id"),
+            leaseToken = json.getString("lease_token"),
+            to = json.getString("to"),
+            body = json.getString("body"),
+            simSlot = json.optInt("sim_slot", 0),
+            isTest = json.optBoolean("is_test", false),
+            expiresAt = json.getString("expires_at")
+        )
+    }
+
+    fun pollGateway(
+        serverUrl: String,
+        deviceToken: String,
+        includeTelemetry: Boolean,
+        appVersion: String,
+        androidVersion: String,
+        permissionSendSms: Boolean,
+        networkType: String,
+        batteryPct: Int,
+        simReady: Boolean,
+        simSlot: Int = 0,
+        carrierLabel: String? = null,
+        maskedMsisdn: String? = null,
+        skipJobPoll: Boolean = false
+    ): GatewayPollResult {
+        val baseUrl = requireHttps(serverUrl)
+        val body = JSONObject().apply {
+            if (skipJobPoll) put("skip_job_poll", true)
+            if (includeTelemetry) {
+                put("app_version", appVersion)
+                put("android_version", androidVersion)
+                put("permission_send_sms", permissionSendSms)
+                put("network_type", networkType)
+                put("battery_pct", batteryPct.coerceIn(0, 100))
+                put("sim_ready", simReady)
+                put("sim_slot", simSlot)
+                if (!carrierLabel.isNullOrBlank()) put("carrier_label", carrierLabel)
+                if (!maskedMsisdn.isNullOrBlank()) put("masked_msisdn", maskedMsisdn)
+            }
+        }
+        val req = Request.Builder()
+            .url("$baseUrl/v1/gateway/poll")
+            .header("Authorization", "Bearer $deviceToken")
+            .post(body.toString().toRequestBody(jsonMedia))
+            .build()
+
+        client.newCall(req).execute().use { res ->
+            val raw = res.body?.string().orEmpty()
+            if (!res.isSuccessful) {
+                throw parseApiError(res.code, raw, "Poll failed")
+            }
+            val json = JSONObject(raw)
+            val jobJson = json.optJSONObject("job")
+            return GatewayPollResult(
+                deviceId = json.optString("device_id"),
+                status = json.optString("status", "online"),
+                serverTime = json.getString("server_time"),
+                job = jobJson?.let { parseLeasedJob(it) }
+            )
+        }
+    }
+
     fun pollNextJob(serverUrl: String, deviceToken: String): LeasedJob? {
         val baseUrl = requireHttps(serverUrl)
         val req = Request.Builder()
@@ -154,16 +219,7 @@ class SimVaultGatewayClient {
             if (!res.isSuccessful) {
                 throw parseApiError(res.code, raw, "Poll failed")
             }
-            val json = JSONObject(raw)
-            return LeasedJob(
-                jobId = json.getString("job_id"),
-                leaseToken = json.getString("lease_token"),
-                to = json.getString("to"),
-                body = json.getString("body"),
-                simSlot = json.optInt("sim_slot", 0),
-                isTest = json.optBoolean("is_test", false),
-                expiresAt = json.getString("expires_at")
-            )
+            return parseLeasedJob(JSONObject(raw))
         }
     }
 
@@ -224,10 +280,11 @@ class SimVaultGatewayClient {
 
     companion object {
         private val sharedHttpClient: OkHttpClient = OkHttpClient.Builder()
-            .connectTimeout(12, TimeUnit.SECONDS)
-            .readTimeout(20, TimeUnit.SECONDS)
-            .writeTimeout(15, TimeUnit.SECONDS)
-            .connectionPool(ConnectionPool(4, 90, TimeUnit.SECONDS))
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(12, TimeUnit.SECONDS)
+            .writeTimeout(10, TimeUnit.SECONDS)
+            .pingInterval(25, TimeUnit.SECONDS)
+            .connectionPool(ConnectionPool(4, 2, TimeUnit.MINUTES))
             .retryOnConnectionFailure(true)
             .build()
     }

@@ -10,6 +10,7 @@ import {
   createSmsRequest,
   leaseNextGatewayJob,
   markJobAcceptedByDevice,
+  recordGatewayHeartbeat,
   reportDeliveryReceipt,
   reportJobResult,
   requireScope,
@@ -327,86 +328,63 @@ export function createV1Router(db: DbClient): Router {
   router.post('/gateway/heartbeat', async (req: Request, res: Response) => {
     try {
       const dev = await authenticateGatewayDevice(db, getBearer(req));
-      const {
-        app_version,
-        android_version,
-        permission_send_sms,
-        network_type,
-        battery_pct,
-        sim_ready,
-        sim_slot,
-        carrier_label,
-        masked_msisdn,
-      } = req.body ?? {};
+      const hb = await recordGatewayHeartbeat(db, dev, req.body ?? {});
+      res.json({ device_id: hb.device_id, status: hb.status, server_time: hb.server_time });
+    } catch (err) {
+      sendError(res, err, getReqId(req));
+    }
+  });
+
+  // Fast combined gateway poll: smart-throttled heartbeat + job lease in a single HTTPS round-trip
+  router.post('/gateway/poll', async (req: Request, res: Response) => {
+    try {
+      const dev = await authenticateGatewayDevice(db, getBearer(req));
+      const body = (req.body ?? {}) as Record<string, unknown>;
       const now = new Date();
       const nowIso = now.toISOString();
-      const nextStatus = dev.status === 'paused' ? 'paused' : 'online';
-      const boundedBattery =
-        typeof battery_pct === 'number' && Number.isFinite(battery_pct)
-          ? Math.max(0, Math.min(100, Math.round(battery_pct)))
-          : null;
 
-      await db.run(
-        `UPDATE gateway_devices
-         SET status = ?,
-             app_version = COALESCE(?, app_version),
-             android_version = COALESCE(?, android_version),
-             permission_send_sms = COALESCE(?, permission_send_sms),
-             network_type = COALESCE(?, network_type),
-             battery_pct = COALESCE(?, battery_pct),
-             sim_ready = COALESCE(?, sim_ready),
-             last_heartbeat_at = ?
-         WHERE id = ?`,
-        nextStatus,
-        app_version ? String(app_version).slice(0, 32) : null,
-        android_version ? String(android_version).slice(0, 40) : null,
-        typeof permission_send_sms === 'boolean' ? (permission_send_sms ? 1 : 0) : null,
-        network_type ? String(network_type).slice(0, 40) : null,
-        boundedBattery,
-        typeof sim_ready === 'boolean' ? (sim_ready ? 1 : 0) : null,
-        nowIso,
-        dev.id
-      );
+      const hasTelemetry =
+        body.force_telemetry === true ||
+        body.app_version !== undefined ||
+        body.android_version !== undefined ||
+        body.permission_send_sms !== undefined ||
+        body.network_type !== undefined ||
+        body.battery_pct !== undefined ||
+        body.sim_ready !== undefined ||
+        body.sim_slot !== undefined ||
+        body.carrier_label !== undefined ||
+        body.masked_msisdn !== undefined;
 
-      if (carrier_label || masked_msisdn || typeof sim_slot === 'number') {
-        const slotIdx = typeof sim_slot === 'number' && Number.isFinite(sim_slot) ? Math.max(0, Math.min(3, Math.trunc(sim_slot))) : 0;
-        const simRow = await db.get<{ id: string }>(
-          'SELECT id FROM sims WHERE device_id = ? AND slot_index = ?',
-          dev.id,
-          slotIdx
-        );
-        if (simRow) {
-          await db.run(
-            `UPDATE sims
-             SET carrier_label = COALESCE(?, carrier_label),
-                 masked_msisdn = COALESCE(?, masked_msisdn),
-                 updated_at = ?
-             WHERE id = ?`,
-            carrier_label ? String(carrier_label).slice(0, 64) : null,
-            masked_msisdn ? String(masked_msisdn).slice(0, 32) : null,
-            nowIso,
-            simRow.id
-          );
-        } else {
-          const cycleStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
-          const cycleEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().slice(0, 10);
-          await db.run(
-            `INSERT INTO sims (id, device_id, carrier_label, masked_msisdn, slot_index, plan_sms_limit, period_start, period_end, estimated_sms_sent, estimated_sms_remaining, warning_threshold, notes, updated_at)
-             VALUES (?, ?, ?, ?, ?, 3000, ?, ?, 0, 3000, 300, ?, ?)`,
-            `sim_${dev.id}_${slotIdx}`,
-            dev.id,
-            carrier_label ? String(carrier_label).slice(0, 64) : `SIM Slot ${slotIdx}`,
-            masked_msisdn ? String(masked_msisdn).slice(0, 32) : 'Pending telemetry',
-            slotIdx,
-            cycleStart,
-            cycleEnd,
-            'Live SIM — reconcile monthly against your carrier statement.',
-            nowIso
-          );
-        }
+      const lastHbMs = dev.lastHeartbeatAt ? Date.parse(dev.lastHeartbeatAt) : 0;
+      const heartbeatAgeMs = Number.isFinite(lastHbMs) && lastHbMs > 0 ? now.getTime() - lastHbMs : Number.MAX_SAFE_INTEGER;
+      const shouldWriteHeartbeat = hasTelemetry || dev.status === 'offline' || heartbeatAgeMs >= 15_000;
+
+      let effectiveStatus = dev.status === 'paused' ? 'paused' : 'online';
+      let effectivePermission = dev.permissionSendSms;
+      let effectiveSimReady = dev.simReady;
+
+      if (shouldWriteHeartbeat) {
+        const hb = await recordGatewayHeartbeat(db, dev, body, now);
+        effectiveStatus = hb.status;
+        effectivePermission = hb.permissionSendSms;
+        effectiveSimReady = hb.simReady;
       }
 
-      res.json({ device_id: dev.id, status: nextStatus, server_time: nowIso });
+      const job =
+        effectiveStatus === 'online' && effectivePermission && effectiveSimReady && body.skip_job_poll !== true
+          ? await leaseNextGatewayJob(db, dev.id, {
+              status: effectiveStatus,
+              permissionSendSms: effectivePermission,
+              simReady: effectiveSimReady,
+            })
+          : null;
+
+      res.json({
+        device_id: dev.id,
+        status: effectiveStatus,
+        server_time: nowIso,
+        job,
+      });
     } catch (err) {
       sendError(res, err, getReqId(req));
     }
@@ -415,7 +393,11 @@ export function createV1Router(db: DbClient): Router {
   router.get('/gateway/jobs/next', async (req: Request, res: Response) => {
     try {
       const dev = await authenticateGatewayDevice(db, getBearer(req));
-      const job = await leaseNextGatewayJob(db, dev.id);
+      const job = await leaseNextGatewayJob(db, dev.id, {
+        status: dev.status,
+        permissionSendSms: dev.permissionSendSms,
+        simReady: dev.simReady,
+      });
       if (!job) {
         res.status(204).end();
         return;
