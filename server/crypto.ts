@@ -166,6 +166,12 @@ export function verifyPassword(password: string, storedHash: string): boolean {
   return crypto.timingSafeEqual(derived, expected);
 }
 
+export function constantTimeEquals(a: string, b: string): boolean {
+  const hashA = crypto.createHash('sha256').update(a).digest();
+  const hashB = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
+
 export function signWebhookPayload(secret: string, timestamp: string, eventId: string, bodyJson: string): string {
   const signedContent = `${timestamp}.${eventId}.${bodyJson}`;
   return crypto.createHmac('sha256', secret).update(signedContent).digest('hex');

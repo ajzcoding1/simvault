@@ -12,13 +12,16 @@ import {
   resolvePostgresUrl,
   syncEnvAdminCredentials,
 } from '../server/db';
-import { decryptField, generateApiKey, hashApiKey, hashOtpCode, verifyPassword } from '../server/crypto';
+import { computeTotpCode, decryptField, generateApiKey, hashApiKey, hashOtpCode, verifyPassword } from '../server/crypto';
+import { createSimVaultApp } from '../server/app';
 import { createAdminRouter } from '../server/routes/admin';
 import { createV1Router } from '../server/routes/v1';
 import {
   AppError,
   assertPublicWebhookHost,
   authenticateApiKey,
+  checkLoginRateLimit,
+  clearLoginFailures,
   createOtpChallenge,
   createSmsRequest,
   leaseNextGatewayJob,
@@ -522,9 +525,414 @@ test('POST /v1/gateway/poll handles telemetry, single-round-trip lease, idle wri
     });
     assert.equal(resReport.status, 200);
 
+    // Repeating same outcome after a 5G->4G handoff retry should succeed idempotently
+    const resRetry = await fetch(`${baseUrl}/v1/gateway/jobs/${sms.message_id}/result`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${enrolled.device_token}`,
+      },
+      body: JSON.stringify({ status: 'sent_to_network' }),
+    });
+    assert.equal(resRetry.status, 200);
+
     const msgRow = (await db.get<{ status: string }>('SELECT status FROM messages WHERE id = ?', sms.message_id))!;
     assert.equal(msgRow.status, 'sent_to_network');
   });
 });
+
+test('Personal SMS and Bulk SMS work via Owner Admin API and /v1 API, enforce scopes/limits, and decrypt cleanly for Gateway', async () => {
+  const db = await createIsolatedTestDb();
+
+  await withServer(db, async (baseUrl) => {
+    // 1. Login as owner + enroll gateway device
+    const loginRes = await fetch(`${baseUrl}/api/admin/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'owner@simvault.local', password: 'SimVault!2026' }),
+    });
+    const cookieHeader = (loginRes.headers.get('set-cookie') ?? '').split(';')[0];
+    const loginBody = (await loginRes.json()) as { csrf_token: string };
+
+    const tokenRes = await fetch(`${baseUrl}/api/admin/devices/enrollment-tokens`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookieHeader,
+        'X-CSRF-Token': loginBody.csrf_token,
+      },
+      body: JSON.stringify({ device_name: 'Gateway Bulk Test', ttl_minutes: 15 }),
+    });
+    const { enrollment_token_once } = (await tokenRes.json()) as { enrollment_token_once: string };
+
+    const enrollRes = await fetch(`${baseUrl}/v1/gateway/enroll`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enrollment_token: enrollment_token_once,
+        device_name: 'Gateway Bulk Test',
+        app_version: '1.3.1',
+        android_version: '14 (API 34)',
+      }),
+    });
+    const enrolled = (await enrollRes.json()) as { device_id: string; device_token: string };
+
+    await fetch(`${baseUrl}/v1/gateway/heartbeat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${enrolled.device_token}`,
+      },
+      body: JSON.stringify({
+        app_version: '1.3.1',
+        permission_send_sms: true,
+        sim_ready: true,
+        sim_slot: 0,
+      }),
+    });
+
+    // 2. Owner sends a direct Personal SMS via /api/admin/messages/personal
+    const personalRes = await fetch(`${baseUrl}/api/admin/messages/personal`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookieHeader,
+        'X-CSRF-Token': loginBody.csrf_token,
+      },
+      body: JSON.stringify({
+        application_id: 'app_portal_prod',
+        to: '+919876543210',
+        body: 'Namaste! Custom personal dispatch without template.',
+        idempotency_key: 'pers_001',
+      }),
+    });
+    assert.equal(personalRes.status, 202);
+    const personalJson = (await personalRes.json()) as {
+      message_id: string;
+      status: string;
+      destination_masked: string;
+      segment_info: { segments: number; encoding: string };
+    };
+    assert.equal(personalJson.status, 'queued');
+    assert.equal(personalJson.segment_info.encoding, 'GSM-7');
+    assert.equal(personalJson.segment_info.segments, 1);
+
+    // Idempotent replay returns 200 with same message_id
+    const personalReplay = await fetch(`${baseUrl}/api/admin/messages/personal`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookieHeader,
+        'X-CSRF-Token': loginBody.csrf_token,
+      },
+      body: JSON.stringify({
+        application_id: 'app_portal_prod',
+        to: '+919876543210',
+        body: 'Namaste! Custom personal dispatch without template.',
+        idempotency_key: 'pers_001',
+      }),
+    });
+    assert.equal(personalReplay.status, 200);
+
+    // Invalid E.164 and over-640 char body rejected cleanly
+    const badPhoneRes = await fetch(`${baseUrl}/api/admin/messages/personal`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookieHeader,
+        'X-CSRF-Token': loginBody.csrf_token,
+      },
+      body: JSON.stringify({
+        application_id: 'app_portal_prod',
+        to: 'invalid_phone',
+        body: 'Hello',
+      }),
+    });
+    assert.equal(badPhoneRes.status, 422);
+
+    const tooLongRes = await fetch(`${baseUrl}/api/admin/messages/personal`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookieHeader,
+        'X-CSRF-Token': loginBody.csrf_token,
+      },
+      body: JSON.stringify({
+        application_id: 'app_portal_prod',
+        to: '+919876543210',
+        body: 'x'.repeat(645),
+      }),
+    });
+    assert.equal(tooLongRes.status, 422);
+
+    // Gateway polls and receives decrypted custom body
+    const pollPersonal = await fetch(`${baseUrl}/v1/gateway/poll`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${enrolled.device_token}`,
+      },
+      body: '{}',
+    });
+    assert.equal(pollPersonal.status, 200);
+    const pollPersonalJson = (await pollPersonal.json()) as {
+      job: { job_id: string; to: string; body: string } | null;
+    };
+    assert.ok(pollPersonalJson.job);
+    assert.equal(pollPersonalJson.job.job_id, personalJson.message_id);
+    assert.equal(pollPersonalJson.job.to, '+919876543210');
+    assert.equal(pollPersonalJson.job.body, 'Namaste! Custom personal dispatch without template.');
+
+    // 3. Owner sends Bulk SMS (>30 unique recipients + duplicate + invalid) without hitting IP rate limit
+    const uniqueBatchNumbers = Array.from({ length: 35 }, (_, i) => `+919810000${String(100 + i)}`);
+    const bulkInput = [...uniqueBatchNumbers, uniqueBatchNumbers[0], '12345'].join('\n');
+
+    const bulkRes = await fetch(`${baseUrl}/api/admin/messages/bulk`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookieHeader,
+        'X-CSRF-Token': loginBody.csrf_token,
+      },
+      body: JSON.stringify({
+        application_id: 'app_portal_prod',
+        recipients: bulkInput,
+        body: 'System update completed successfully.',
+        batch_label: 'night_deploy',
+      }),
+    });
+    assert.equal(bulkRes.status, 202);
+    const bulkJson = (await bulkRes.json()) as {
+      batch_id: string;
+      total_submitted: number;
+      queued_count: number;
+      duplicate_count: number;
+      skipped_invalid_count: number;
+      failed_count: number;
+      results: Array<{ to_masked: string; status: string; message_id?: string }>;
+    };
+    assert.ok(bulkJson.batch_id.startsWith('batch_'));
+    assert.equal(bulkJson.queued_count, 35);
+    assert.equal(bulkJson.duplicate_count, 1);
+    assert.equal(bulkJson.skipped_invalid_count, 1);
+    assert.equal(bulkJson.failed_count, 0);
+    assert.equal(bulkJson.total_submitted, 37);
+
+    // 4. API key with sms:send can call /v1/sms/personal & /v1/sms/bulk; key without sms:send gets 403
+    const sendKey = generateApiKey('live');
+    await db.run(
+      `INSERT INTO api_keys (id, application_id, name, key_prefix, secret_hash, scopes_json, status, created_at)
+       VALUES ('key_send_ok', 'app_portal_prod', 'Send Key', ?, ?, '["sms:send"]', 'active', ?)`,
+      sendKey.keyPrefix,
+      sendKey.secretHash,
+      new Date().toISOString()
+    );
+    const readOnlyKey = generateApiKey('live');
+    await db.run(
+      `INSERT INTO api_keys (id, application_id, name, key_prefix, secret_hash, scopes_json, status, created_at)
+       VALUES ('key_read_only', 'app_portal_prod', 'Read Key', ?, ?, '["usage:read"]', 'active', ?)`,
+      readOnlyKey.keyPrefix,
+      readOnlyKey.secretHash,
+      new Date().toISOString()
+    );
+
+    const v1Forbidden = await fetch(`${baseUrl}/v1/sms/personal`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${readOnlyKey.rawKey}`,
+      },
+      body: JSON.stringify({ to: '+919876543211', body: 'Should be blocked' }),
+    });
+    assert.equal(v1Forbidden.status, 403);
+
+    const v1Personal = await fetch(`${baseUrl}/v1/sms/personal`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${sendKey.rawKey}`,
+      },
+      body: JSON.stringify({ to: '+919876543211', body: 'API personal message check' }),
+    });
+    assert.equal(v1Personal.status, 202);
+
+    const v1Bulk = await fetch(`${baseUrl}/v1/sms/bulk`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${sendKey.rawKey}`,
+      },
+      body: JSON.stringify({
+        recipients: ['+919876543212', '+919876543213'],
+        template_id: 'login_notice',
+        variables: { name: 'Aarav', device_label: 'API Client' },
+      }),
+    });
+    assert.equal(v1Bulk.status, 202);
+    const v1BulkJson = (await v1Bulk.json()) as { queued_count: number; template_id: string };
+    assert.equal(v1BulkJson.queued_count, 2);
+    assert.equal(v1BulkJson.template_id, 'login_notice');
+  });
+});
+
+test('Security hardening: type confusion rejection, TOTP replay protection, MFA disable re-auth, account lockout, and cron fail-closed auth', async () => {
+  const db = await createIsolatedTestDb();
+
+  await withServer(db, async (baseUrl) => {
+    const sendKey = generateApiKey('live');
+    await db.run(
+      `INSERT INTO api_keys (id, application_id, name, key_prefix, secret_hash, scopes_json, status, created_at)
+       VALUES ('key_type_check', 'app_portal_prod', 'Type Check Key', ?, ?, '["sms:send"]', 'active', ?)`,
+      sendKey.keyPrefix,
+      sendKey.secretHash,
+      new Date().toISOString()
+    );
+
+    // 1. Type confusion objects rejected on /v1/sms & /v1/sms/personal
+    const badTypePersonal = await fetch(`${baseUrl}/v1/sms/personal`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${sendKey.rawKey}`,
+      },
+      body: JSON.stringify({ to: { nested: 1 }, body: ['bad'] }),
+    });
+    assert.equal(badTypePersonal.status, 400);
+
+    const badTypeSms = await fetch(`${baseUrl}/v1/sms`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${sendKey.rawKey}`,
+      },
+      body: JSON.stringify({ to: '+919876543210', template_id: { obj: true } }),
+    });
+    assert.equal(badTypeSms.status, 400);
+
+    // 2. Owner login -> enable MFA -> verify TOTP replay blocked -> MFA disable requires password/TOTP
+    const loginRes = await fetch(`${baseUrl}/api/admin/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'owner@simvault.local', password: 'SimVault!2026' }),
+    });
+    assert.equal(loginRes.status, 200);
+    const cookieHeader = (loginRes.headers.get('set-cookie') ?? '').split(';')[0];
+    const loginBody = (await loginRes.json()) as { csrf_token: string };
+
+    const mfaCfgRes = await fetch(`${baseUrl}/api/admin/security/mfa`, {
+      headers: { Cookie: cookieHeader },
+    });
+    const mfaCfg = (await mfaCfgRes.json()) as { secret_preview: string };
+    const code1 = computeTotpCode(mfaCfg.secret_preview, Date.now() - 30_000);
+
+    const enableRes = await fetch(`${baseUrl}/api/admin/security/mfa/enable`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookieHeader,
+        'X-CSRF-Token': loginBody.csrf_token,
+      },
+      body: JSON.stringify({ code: code1 }),
+    });
+    assert.equal(enableRes.status, 200);
+
+    // MFA disable without current_password or totp_code must fail 401
+    const badDisable = await fetch(`${baseUrl}/api/admin/security/mfa/disable`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookieHeader,
+        'X-CSRF-Token': loginBody.csrf_token,
+      },
+      body: JSON.stringify({}),
+    });
+    assert.equal(badDisable.status, 401);
+
+    // Login with TOTP code2 succeeds once, then replaying code2 fails 401
+    const code2 = computeTotpCode(mfaCfg.secret_preview, Date.now());
+    const mfaLogin1 = await fetch(`${baseUrl}/api/admin/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'owner@simvault.local', password: 'SimVault!2026', totp_code: code2 }),
+    });
+    assert.equal(mfaLogin1.status, 200);
+
+    const mfaLoginReplay = await fetch(`${baseUrl}/api/admin/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'owner@simvault.local', password: 'SimVault!2026', totp_code: code2 }),
+    });
+    assert.equal(mfaLoginReplay.status, 401);
+
+    // Disable MFA succeeds with valid current_password
+    const okDisable = await fetch(`${baseUrl}/api/admin/security/mfa/disable`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookieHeader,
+        'X-CSRF-Token': loginBody.csrf_token,
+      },
+      body: JSON.stringify({ current_password: 'SimVault!2026' }),
+    });
+    assert.equal(okDisable.status, 200);
+
+    // 3. Account lockout after >8 failed password attempts for an email (independent of IP bucket)
+    clearLoginFailures('127.0.0.1');
+    for (let i = 0; i < 8; i++) {
+      const fail = await fetch(`${baseUrl}/api/admin/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'locktest@simvault.local', password: 'WrongPassword!' }),
+      });
+      assert.equal(fail.status, 401);
+    }
+    assert.equal(checkLoginRateLimit('acct:locktest@simvault.local'), false);
+    const lockedRes = await fetch(`${baseUrl}/api/admin/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'locktest@simvault.local', password: 'WrongPassword!' }),
+    });
+    assert.equal(lockedRes.status, 429);
+    clearLoginFailures('127.0.0.1');
+    clearLoginFailures('acct:locktest@simvault.local');
+  });
+
+  // 4. Cron sweeper fails closed in production when CRON_SECRET is missing, rejects bad bearer, accepts valid bearer
+  const prevNodeEnv = process.env.NODE_ENV;
+  const prevCronSecret = process.env.CRON_SECRET;
+  try {
+    process.env.NODE_ENV = 'production';
+    delete process.env.CRON_SECRET;
+
+    const { app } = await createSimVaultApp(db);
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const missingRes = await fetch(`http://127.0.0.1:${port}/api/cron/sweeper`);
+      assert.equal(missingRes.status, 503);
+
+      process.env.CRON_SECRET = 'super_secret_cron_value_12345';
+      const badAuthRes = await fetch(`http://127.0.0.1:${port}/api/cron/sweeper`, {
+        headers: { Authorization: 'Bearer wrong_secret' },
+      });
+      assert.equal(badAuthRes.status, 401);
+
+      const okAuthRes = await fetch(`http://127.0.0.1:${port}/api/cron/sweeper`, {
+        headers: { Authorization: 'Bearer super_secret_cron_value_12345' },
+      });
+      assert.equal(okAuthRes.status, 200);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  } finally {
+    if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prevNodeEnv;
+    if (prevCronSecret === undefined) delete process.env.CRON_SECRET;
+    else process.env.CRON_SECRET = prevCronSecret;
+  }
+});
+
+
 
 

@@ -168,6 +168,16 @@ const response = await fetch("${baseUrl}/v1/sms", {
                 <td className="py-2.5 px-4 text-slate-600">Queue an approved templated SMS for Android gateway dispatch</td>
               </tr>
               <tr>
+                <td className="py-2.5 px-4 font-mono text-slate-900">POST /v1/sms/personal</td>
+                <td className="py-2.5 px-4 font-mono text-slate-600">sms:send</td>
+                <td className="py-2.5 px-4 text-slate-600">Queue a custom direct personal SMS (1–640 chars) without needing a template</td>
+              </tr>
+              <tr>
+                <td className="py-2.5 px-4 font-mono text-slate-900">POST /v1/sms/bulk</td>
+                <td className="py-2.5 px-4 font-mono text-slate-600">sms:send</td>
+                <td className="py-2.5 px-4 text-slate-600">Queue a bulk SMS batch (custom body or template) up to 100 unique recipients</td>
+              </tr>
+              <tr>
                 <td className="py-2.5 px-4 font-mono text-slate-900">POST /v1/otp/challenges</td>
                 <td className="py-2.5 px-4 font-mono text-slate-600">otp:create</td>
                 <td className="py-2.5 px-4 text-slate-600">Generate CSPRNG 6-digit OTP, store HMAC hash, and queue SMS</td>

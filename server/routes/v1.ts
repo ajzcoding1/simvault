@@ -6,7 +6,9 @@ import {
   AppError,
   authenticateApiKey,
   authenticateGatewayDevice,
+  createBulkSmsRequests,
   createOtpChallenge,
+  createPersonalSmsRequest,
   createSmsRequest,
   leaseNextGatewayJob,
   markJobAcceptedByDevice,
@@ -74,6 +76,19 @@ export function createV1Router(db: DbClient): Router {
             responses: { '202': { description: 'Message queued' } },
           },
         },
+        '/sms/personal': {
+          post: {
+            summary: 'Queue a custom direct personal SMS without a pre-approved template',
+            parameters: [{ name: 'Idempotency-Key', in: 'header', schema: { type: 'string' } }],
+            responses: { '202': { description: 'Personal message queued' } },
+          },
+        },
+        '/sms/bulk': {
+          post: {
+            summary: 'Queue a bulk SMS batch (custom body or approved template) for up to 100 E.164 recipients',
+            responses: { '202': { description: 'Batch processed with per-recipient outcomes' } },
+          },
+        },
         '/otp/challenges': {
           post: {
             summary: 'Create a single-use OTP challenge and queue SMS dispatch',
@@ -109,17 +124,17 @@ export function createV1Router(db: DbClient): Router {
       requireScope(ctx, 'sms:send');
 
       const { to, template_id, variables, purpose, ttl_seconds } = req.body ?? {};
-      if (!to || !template_id || !purpose) {
-        throw new AppError(400, 'BAD_REQUEST', 'Fields to, template_id, and purpose are required.');
+      if (typeof to !== 'string' || typeof template_id !== 'string' || typeof purpose !== 'string' || !to || !template_id || !purpose) {
+        throw new AppError(400, 'BAD_REQUEST', 'Fields to, template_id, and purpose must be non-empty strings.');
       }
       const idempotencyKey = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'].trim() : undefined;
 
       const result = await createSmsRequest(db, {
         applicationId: ctx.applicationId,
-        to: String(to),
-        templateCode: String(template_id),
-        variables: variables && typeof variables === 'object' ? variables : {},
-        purpose: String(purpose),
+        to,
+        templateCode: template_id,
+        variables: variables && typeof variables === 'object' && !Array.isArray(variables) ? variables : {},
+        purpose,
         ttlSeconds: ttl_seconds ? Number(ttl_seconds) : undefined,
         idempotencyKey,
         actorId: ctx.keyId,
@@ -138,6 +153,82 @@ export function createV1Router(db: DbClient): Router {
     }
   });
 
+  // POST /v1/sms/personal
+  router.post('/sms/personal', async (req: Request, res: Response) => {
+    try {
+      const ctx = await authenticateApiKey(db, getBearer(req), hashApiKey);
+      requireScope(ctx, 'sms:send');
+
+      const { to, body, purpose, ttl_seconds } = req.body ?? {};
+      if (typeof to !== 'string' || typeof body !== 'string' || !to || !body) {
+        throw new AppError(400, 'BAD_REQUEST', 'Fields to and body must be non-empty strings.');
+      }
+      if (purpose !== undefined && typeof purpose !== 'string') {
+        throw new AppError(400, 'BAD_REQUEST', 'Field purpose must be a string.');
+      }
+      const idempotencyKey = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'].trim() : undefined;
+
+      const result = await createPersonalSmsRequest(db, {
+        applicationId: ctx.applicationId,
+        to,
+        body,
+        purpose: purpose ? purpose : 'account_transactional',
+        ttlSeconds: ttl_seconds ? Number(ttl_seconds) : undefined,
+        idempotencyKey,
+        actorType: 'application',
+        actorId: ctx.keyId,
+        ipAddress: req.ip,
+      });
+
+      res.status(result.deduplicated ? 200 : 202).json({
+        message_id: result.message_id,
+        status: result.status,
+        destination_masked: result.destination_masked,
+        created_at: result.created_at,
+        segment_info: result.segment_info,
+        ...(result.is_test ? { mode: 'test' } : {}),
+        ...(result.deduplicated ? { idempotent_replay: true } : {}),
+      });
+    } catch (err) {
+      sendError(res, err, getReqId(req));
+    }
+  });
+
+  // POST /v1/sms/bulk
+  router.post('/sms/bulk', async (req: Request, res: Response) => {
+    try {
+      const ctx = await authenticateApiKey(db, getBearer(req), hashApiKey);
+      requireScope(ctx, 'sms:send');
+
+      const { recipients, body, template_id, variables, purpose, ttl_seconds, batch_label } = req.body ?? {};
+      if (!recipients || (!body && !template_id)) {
+        throw new AppError(
+          400,
+          'BAD_REQUEST',
+          'Fields recipients and either body or template_id are required.'
+        );
+      }
+
+      const result = await createBulkSmsRequests(db, {
+        applicationId: ctx.applicationId,
+        recipients: Array.isArray(recipients) ? recipients.map(String) : String(recipients),
+        body: body !== undefined ? String(body) : undefined,
+        templateCode: template_id ? String(template_id) : undefined,
+        variables: variables && typeof variables === 'object' ? variables : {},
+        purpose: purpose ? String(purpose) : undefined,
+        ttlSeconds: ttl_seconds ? Number(ttl_seconds) : undefined,
+        batchLabel: batch_label ? String(batch_label) : undefined,
+        actorType: 'application',
+        actorId: ctx.keyId,
+        ipAddress: req.ip,
+      });
+
+      res.status(202).json(result);
+    } catch (err) {
+      sendError(res, err, getReqId(req));
+    }
+  });
+
   // POST /v1/otp/challenges
   router.post('/otp/challenges', async (req: Request, res: Response) => {
     try {
@@ -145,14 +236,14 @@ export function createV1Router(db: DbClient): Router {
       requireScope(ctx, 'otp:create');
 
       const { to, purpose, ttl_seconds } = req.body ?? {};
-      if (!to || !purpose) {
-        throw new AppError(400, 'BAD_REQUEST', 'Fields to and purpose are required.');
+      if (typeof to !== 'string' || typeof purpose !== 'string' || !to || !purpose) {
+        throw new AppError(400, 'BAD_REQUEST', 'Fields to and purpose must be non-empty strings.');
       }
 
       const result = await createOtpChallenge(db, {
         applicationId: ctx.applicationId,
-        to: String(to),
-        purpose: String(purpose),
+        to,
+        purpose,
         ttlSeconds: ttl_seconds ? Number(ttl_seconds) : undefined,
         actorId: ctx.keyId,
         ipAddress: req.ip,
@@ -176,14 +267,14 @@ export function createV1Router(db: DbClient): Router {
       requireScope(ctx, 'otp:verify');
 
       const { challenge_id, code } = req.body ?? {};
-      if (!challenge_id || !code) {
-        throw new AppError(400, 'BAD_REQUEST', 'Fields challenge_id and code are required.');
+      if (typeof challenge_id !== 'string' || typeof code !== 'string' || !challenge_id || !code) {
+        throw new AppError(400, 'BAD_REQUEST', 'Fields challenge_id and code must be non-empty strings.');
       }
 
       const verified = await verifyOtpChallenge(db, {
         applicationId: ctx.applicationId,
-        challengeId: String(challenge_id),
-        code: String(code),
+        challengeId: challenge_id,
+        code,
         ipAddress: req.ip,
       });
 

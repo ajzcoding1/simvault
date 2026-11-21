@@ -42,6 +42,7 @@ export function SecurityView({
     otpauth_uri: string | null;
   } | null>(null);
   const [totpInput, setTotpInput] = useState('');
+  const [disableMfaCredential, setDisableMfaCredential] = useState('');
   const [mfaErr, setMfaErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -170,10 +171,21 @@ export function SecurityView({
     }
   };
 
-  const handleDisableMfa = async () => {
+  const handleDisableMfa = async (e: FormEvent) => {
+    e.preventDefault();
     setMfaErr(null);
+    const cred = disableMfaCredential.trim();
+    if (!cred) {
+      setMfaErr('Enter your current owner password or a 6-digit authenticator code to disable MFA.');
+      return;
+    }
+    const payload = /^\d{6}$/.test(cred) ? { totp_code: cred } : { current_password: cred };
     try {
-      await apiRequest('/api/admin/security/mfa/disable', { method: 'POST' });
+      await apiRequest('/api/admin/security/mfa/disable', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      setDisableMfaCredential('');
       await loadMfa();
     } catch (err) {
       setMfaErr(err instanceof Error ? err.message : 'Failed to disable MFA');
@@ -354,20 +366,30 @@ export function SecurityView({
             </div>
 
             {mfaState?.mfa_enabled ? (
-              <div className="space-y-3 text-xs text-slate-600">
+              <form onSubmit={(e) => void handleDisableMfa(e)} className="space-y-3 text-xs text-slate-600">
                 <div className="flex items-center gap-2 text-emerald-800 bg-emerald-50 border border-emerald-200 rounded p-3">
                   <ShieldCheck className="w-4 h-4 shrink-0" aria-hidden="true" />
                   <span>RFC 6238 TOTP authenticator is active for owner logins.</span>
                 </div>
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <input
+                    type="password"
+                    aria-label="Current password or 6-digit TOTP code to disable MFA"
+                    value={disableMfaCredential}
+                    onChange={(e) => setDisableMfaCredential(e.target.value)}
+                    placeholder="Current password or 6-digit TOTP"
+                    autoComplete="current-password"
+                    className="flex-1 px-3 py-2 text-xs border border-slate-300 rounded-md text-slate-900"
+                  />
+                  <button
+                    type="submit"
+                    className="px-3 py-2 text-xs font-medium border border-rose-300 text-rose-700 rounded-md hover:bg-rose-50 whitespace-nowrap"
+                  >
+                    Disable MFA
+                  </button>
+                </div>
                 {mfaErr && <p className="text-rose-700">{mfaErr}</p>}
-                <button
-                  type="button"
-                  onClick={() => void handleDisableMfa()}
-                  className="px-3 py-1.5 text-xs font-medium border border-rose-300 text-rose-700 rounded hover:bg-rose-50"
-                >
-                  Disable MFA
-                </button>
-              </div>
+              </form>
             ) : (
               <form onSubmit={handleEnableMfa} className="space-y-3 text-xs">
                 <p className="text-slate-600">

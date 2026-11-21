@@ -8,12 +8,16 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.simvault.gateway.MainActivity
 import com.simvault.gateway.R
 import com.simvault.gateway.data.SecureCredentialStore
+import com.simvault.gateway.network.SimVaultGatewayClient
 import com.simvault.gateway.worker.GatewayPollEngine
 import com.simvault.gateway.worker.PollCycleOutcome
 import kotlinx.coroutines.CoroutineScope
@@ -21,20 +25,66 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 class GatewayForegroundService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var pollLoopJob: Job? = null
+    private val wakeSignal = Channel<Unit>(Channel.CONFLATED)
+    private var networkCallbackRegistered = false
+    @Volatile private var lastNetworkHandle: Long? = null
+    @Volatile private var lastLinkSignature: String? = null
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            val handle = network.networkHandle
+            if (lastNetworkHandle != handle) {
+                lastNetworkHandle = handle
+                SimVaultGatewayClient.resetConnections()
+                wakeSignal.trySend(Unit)
+            }
+        }
+
+        override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+            val sig = "${network.networkHandle}|${linkProperties.interfaceName}|${linkProperties.linkAddresses.joinToString(",") { it.address.hostAddress.orEmpty() }}"
+            if (lastLinkSignature != null && lastLinkSignature != sig) {
+                SimVaultGatewayClient.resetConnections()
+                wakeSignal.trySend(Unit)
+            }
+            lastLinkSignature = sig
+        }
+
+        override fun onLost(network: Network) {
+            SimVaultGatewayClient.resetConnections()
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         ensureNotificationChannel()
+        registerNetworkHandoffCallback()
+    }
+
+    private fun registerNetworkHandoffCallback() {
+        if (networkCallbackRegistered) return
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        runCatching {
+            cm.registerDefaultNetworkCallback(networkCallback)
+            networkCallbackRegistered = true
+        }
+    }
+
+    private fun unregisterNetworkHandoffCallback() {
+        if (!networkCallbackRegistered) return
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        runCatching { cm.unregisterNetworkCallback(networkCallback) }
+        networkCallbackRegistered = false
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -65,6 +115,7 @@ class GatewayForegroundService : Service() {
 
         pollLoopJob = serviceScope.launch {
             var backoffMs = BASE_POLL_INTERVAL_MS
+            var consecutiveErrors = 0
             val store = SecureCredentialStore(applicationContext)
 
             while (isActive) {
@@ -75,6 +126,7 @@ class GatewayForegroundService : Service() {
 
                 when (val outcome = GatewayPollEngine.runPollCycle(applicationContext)) {
                     is PollCycleOutcome.Success -> {
+                        consecutiveErrors = 0
                         backoffMs = when {
                             store.isPaused() || outcome.serverStatus == "paused" -> 15_000L
                             outcome.hasMoreLikely -> BATCH_CONTINUE_DELAY_MS
@@ -95,12 +147,22 @@ class GatewayForegroundService : Service() {
                         break
                     }
                     is PollCycleOutcome.TransientError -> {
+                        consecutiveErrors++
                         updateNotification("Reconnecting (${outcome.reason.take(40)})")
-                        backoffMs = (backoffMs * 2).coerceAtMost(MAX_BACKOFF_MS)
+                        backoffMs = when (consecutiveErrors) {
+                            1 -> 1_500L
+                            2 -> 3_000L
+                            3 -> 6_000L
+                            else -> (backoffMs * 2).coerceAtMost(MAX_BACKOFF_MS)
+                        }
                     }
                 }
 
-                delay(backoffMs)
+                val wokenByNetworkChange = withTimeoutOrNull(backoffMs) { wakeSignal.receive() } != null
+                if (wokenByNetworkChange) {
+                    consecutiveErrors = 0
+                    backoffMs = BASE_POLL_INTERVAL_MS
+                }
             }
         }
     }
@@ -151,7 +213,9 @@ class GatewayForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        unregisterNetworkHandoffCallback()
         pollLoopJob?.cancel()
+        wakeSignal.close()
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -161,7 +225,7 @@ class GatewayForegroundService : Service() {
         private const val NOTIFICATION_ID = 4109
         private const val BASE_POLL_INTERVAL_MS = 2_500L
         private const val BATCH_CONTINUE_DELAY_MS = 150L
-        private const val MAX_BACKOFF_MS = 30_000L
+        private const val MAX_BACKOFF_MS = 20_000L
         private const val ACTION_STOP = "com.simvault.gateway.action.STOP_SERVICE"
 
         fun start(context: Context) {

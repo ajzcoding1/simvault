@@ -18,6 +18,9 @@ import com.simvault.gateway.sms.NativeSmsSender
 import com.simvault.gateway.sms.SmsDispatchOutcome
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.time.Instant
 
 sealed class PollCycleOutcome {
@@ -39,6 +42,7 @@ object GatewayPollEngine {
     private val pollMutex = Mutex()
     private var lastTelemetrySentAtMs: Long = 0L
     private var lastTelemetryFingerprint: String = ""
+    private var lastNetworkType: String? = null
 
     private fun isJobExpired(expiresAtIso: String): Boolean {
         return try {
@@ -48,10 +52,29 @@ object GatewayPollEngine {
         }
     }
 
+    private fun hasInternetCapability(context: Context): Boolean {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return true
+        val active = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(active) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
     suspend fun runPollCycle(context: Context): PollCycleOutcome = pollMutex.withLock {
         val appContext = context.applicationContext
         val store = SecureCredentialStore(appContext)
         if (!store.isEnrolled()) return@withLock PollCycleOutcome.NotEnrolled
+
+        val networkType = readNetworkType(appContext)
+        if (lastNetworkType != null && lastNetworkType != networkType) {
+            SimVaultGatewayClient.resetConnections()
+        }
+        lastNetworkType = networkType
+
+        if (!hasInternetCapability(appContext)) {
+            val msg = "Network switching (5G/4G) · waiting for data"
+            store.setLastError(msg)
+            return@withLock PollCycleOutcome.TransientError(msg)
+        }
 
         val client = SimVaultGatewayClient()
         val smsSender = NativeSmsSender(appContext)
@@ -65,7 +88,6 @@ object GatewayPollEngine {
         val activeSim = sims.firstOrNull { it.slotIndex == chosenSlot } ?: sims.firstOrNull()
         val simReady = store.isMockMode() || (hasPerm && activeSim != null)
         val locallyPaused = store.isPaused()
-        val networkType = readNetworkType(appContext)
         val batteryPct = readBatteryPct(appContext)
         val simSlot = activeSim?.slotIndex ?: chosenSlot
         val fingerprint = "$hasPerm|$simReady|$simSlot|$networkType|${batteryPct / 5}|${activeSim?.carrierLabel.orEmpty()}"
@@ -171,7 +193,13 @@ object GatewayPollEngine {
                 PollCycleOutcome.TransientError(msg)
             }
         } catch (e: Exception) {
-            val msg = e.message ?: "Network error during poll"
+            SimVaultGatewayClient.resetConnections()
+            val msg = when (e) {
+                is SocketTimeoutException,
+                is ConnectException,
+                is UnknownHostException -> "Network switching (5G/4G) · reconnecting"
+                else -> e.message ?: "Network error during poll"
+            }
             store.setLastError(msg)
             PollCycleOutcome.TransientError(msg)
         }

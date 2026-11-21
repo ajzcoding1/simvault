@@ -7,11 +7,15 @@ import com.simvault.gateway.data.HealthCheckResult
 import com.simvault.gateway.data.HeartbeatResult
 import com.simvault.gateway.data.LeasedJob
 import okhttp3.ConnectionPool
+import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import java.io.IOException
+import java.net.Inet4Address
+import java.net.Inet6Address
 import java.util.concurrent.TimeUnit
 
 class SimVaultGatewayClient {
@@ -21,10 +25,32 @@ class SimVaultGatewayClient {
 
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
 
+    private fun <T> executeWithSocketRecovery(block: () -> T): T {
+        var attempt = 0
+        while (true) {
+            try {
+                return block()
+            } catch (e: IOException) {
+                resetConnections()
+                if (attempt >= 1) {
+                    throw e
+                }
+                attempt++
+                try {
+                    Thread.sleep(250)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw e
+                }
+            }
+        }
+    }
+
     private fun requireHttps(serverUrl: String): String {
         val normalized = serverUrl.trim().trimEnd('/')
-        if (!normalized.startsWith("https://")) {
-            throw IllegalArgumentException("HTTPS server URL is required for live gateway security.")
+        val uri = runCatching { java.net.URI(normalized) }.getOrNull()
+        if (uri == null || !uri.scheme.equals("https", ignoreCase = true) || uri.host.isNullOrBlank() || !uri.userInfo.isNullOrEmpty()) {
+            throw IllegalArgumentException("Valid HTTPS server URL (without embedded credentials) is required.")
         }
         return normalized
     }
@@ -40,7 +66,7 @@ class SimVaultGatewayClient {
         }
     }
 
-    fun checkHealth(serverUrl: String): HealthCheckResult {
+    fun checkHealth(serverUrl: String): HealthCheckResult = executeWithSocketRecovery {
         val baseUrl = requireHttps(serverUrl)
         val req = Request.Builder()
             .url("$baseUrl/health")
@@ -53,7 +79,7 @@ class SimVaultGatewayClient {
                 throw parseApiError(res.code, raw, "Health check failed")
             }
             val json = JSONObject(raw)
-            return HealthCheckResult(
+            HealthCheckResult(
                 status = json.optString("status", "unknown"),
                 version = json.optString("version", "1.0.0"),
                 mode = json.optString("mode", "production"),
@@ -108,7 +134,7 @@ class SimVaultGatewayClient {
         simSlot: Int = 0,
         carrierLabel: String? = null,
         maskedMsisdn: String? = null
-    ): HeartbeatResult {
+    ): HeartbeatResult = executeWithSocketRecovery {
         val baseUrl = requireHttps(serverUrl)
         val body = JSONObject().apply {
             put("app_version", appVersion)
@@ -133,7 +159,7 @@ class SimVaultGatewayClient {
                 throw parseApiError(res.code, raw, "Heartbeat failed")
             }
             val json = JSONObject(raw)
-            return HeartbeatResult(
+            HeartbeatResult(
                 deviceId = json.optString("device_id"),
                 status = json.optString("status", "online"),
                 serverTime = json.getString("server_time")
@@ -167,7 +193,7 @@ class SimVaultGatewayClient {
         carrierLabel: String? = null,
         maskedMsisdn: String? = null,
         skipJobPoll: Boolean = false
-    ): GatewayPollResult {
+    ): GatewayPollResult = executeWithSocketRecovery {
         val baseUrl = requireHttps(serverUrl)
         val body = JSONObject().apply {
             if (skipJobPoll) put("skip_job_poll", true)
@@ -196,7 +222,7 @@ class SimVaultGatewayClient {
             }
             val json = JSONObject(raw)
             val jobJson = json.optJSONObject("job")
-            return GatewayPollResult(
+            GatewayPollResult(
                 deviceId = json.optString("device_id"),
                 status = json.optString("status", "online"),
                 serverTime = json.getString("server_time"),
@@ -205,7 +231,7 @@ class SimVaultGatewayClient {
         }
     }
 
-    fun pollNextJob(serverUrl: String, deviceToken: String): LeasedJob? {
+    fun pollNextJob(serverUrl: String, deviceToken: String): LeasedJob? = executeWithSocketRecovery {
         val baseUrl = requireHttps(serverUrl)
         val req = Request.Builder()
             .url("$baseUrl/v1/gateway/jobs/next")
@@ -214,12 +240,12 @@ class SimVaultGatewayClient {
             .build()
 
         client.newCall(req).execute().use { res ->
-            if (res.code == 204) return null
+            if (res.code == 204) return@executeWithSocketRecovery null
             val raw = res.body?.string().orEmpty()
             if (!res.isSuccessful) {
                 throw parseApiError(res.code, raw, "Poll failed")
             }
-            return parseLeasedJob(JSONObject(raw))
+            parseLeasedJob(JSONObject(raw))
         }
     }
 
@@ -244,7 +270,7 @@ class SimVaultGatewayClient {
         jobId: String,
         status: String,
         errorCode: String? = null
-    ) {
+    ) = executeWithSocketRecovery {
         val baseUrl = requireHttps(serverUrl)
         val body = JSONObject().apply {
             put("status", status)
@@ -263,7 +289,7 @@ class SimVaultGatewayClient {
         }
     }
 
-    fun reportDeliveryReceipt(serverUrl: String, deviceToken: String, jobId: String) {
+    fun reportDeliveryReceipt(serverUrl: String, deviceToken: String, jobId: String) = executeWithSocketRecovery {
         val baseUrl = requireHttps(serverUrl)
         val req = Request.Builder()
             .url("$baseUrl/v1/gateway/jobs/$jobId/delivery-report")
@@ -279,13 +305,27 @@ class SimVaultGatewayClient {
     }
 
     companion object {
+        // Prefer IPv4 first on dual-stack cellular (avoids 5G->4G IPv6 prefix-change blackhole timeouts)
+        private val resilientDns = Dns { hostname ->
+            val addresses = Dns.SYSTEM.lookup(hostname)
+            val v4 = addresses.filterIsInstance<Inet4Address>()
+            val v6 = addresses.filterIsInstance<Inet6Address>()
+            if (v4.isNotEmpty()) v4 + v6 else addresses
+        }
+
         private val sharedHttpClient: OkHttpClient = OkHttpClient.Builder()
-            .connectTimeout(8, TimeUnit.SECONDS)
-            .readTimeout(12, TimeUnit.SECONDS)
-            .writeTimeout(10, TimeUnit.SECONDS)
-            .pingInterval(25, TimeUnit.SECONDS)
-            .connectionPool(ConnectionPool(4, 2, TimeUnit.MINUTES))
+            .dns(resilientDns)
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .writeTimeout(6, TimeUnit.SECONDS)
+            .callTimeout(14, TimeUnit.SECONDS)
+            .pingInterval(15, TimeUnit.SECONDS)
+            .connectionPool(ConnectionPool(2, 45, TimeUnit.SECONDS))
             .retryOnConnectionFailure(true)
             .build()
+
+        fun resetConnections() {
+            sharedHttpClient.connectionPool.evictAll()
+        }
     }
 }

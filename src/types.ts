@@ -173,8 +173,47 @@ export interface AuditLogRecord {
   created_at: string;
 }
 
+export interface SmsSegmentSummary {
+  encoding: 'GSM-7' | 'UCS-2';
+  length: number;
+  segments: number;
+  perSegmentLimit: number;
+  remainingInSegment: number;
+}
+
+export interface PersonalSmsResponse {
+  message_id: string;
+  status: MessageStatus;
+  destination_masked: string;
+  created_at: string;
+  is_test: boolean;
+  deduplicated: boolean;
+  segment_info: SmsSegmentSummary;
+}
+
+export interface BulkRecipientOutcomeRecord {
+  to_masked: string;
+  status: 'queued' | 'skipped_invalid' | 'failed';
+  message_id?: string;
+  error_code?: string;
+  error_message?: string;
+}
+
+export interface BulkSmsResponse {
+  batch_id: string;
+  total_submitted: number;
+  queued_count: number;
+  skipped_invalid_count: number;
+  duplicate_count: number;
+  failed_count: number;
+  template_id: string;
+  segment_info: SmsSegmentSummary;
+  results: BulkRecipientOutcomeRecord[];
+}
+
 export type NavSection =
   | 'overview'
+  | 'compose'
   | 'applications'
   | 'api-keys'
   | 'api-docs'

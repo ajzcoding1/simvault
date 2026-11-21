@@ -11,6 +11,7 @@ import {
   parseApiKeyPrefix,
   redactSensitiveMetadata,
   renderTemplate,
+  sanitizeSmsText,
 } from '../src/shared/smsRules';
 
 test('E.164 validation and masking hide inner digits while preserving last 4', () => {
@@ -97,3 +98,44 @@ test('SSRF guards block non-HTTPS, private/loopback IPs, metadata IPs, and .exam
   assert.equal(isValidWebhookUrl('https://user:pass@api.acme.com/hooks'), false);
   assert.equal(isValidWebhookUrl('https://api.acme.com/webhooks/simvault'), true);
 });
+
+import { calculateSmsSegmentInfo, parseBulkPhoneList } from '../src/shared/smsRules';
+
+test('parseBulkPhoneList normalizes, deduplicates, and separates invalid entries', () => {
+  const parsed = parseBulkPhoneList('+91 98765 43210\n+919876543210, +1 (415) 555-0142; 9811122233\n+919811122233 +919822233344');
+  assert.deepEqual(parsed.validNumbers, ['+919876543210', '+14155550142', '+919811122233', '+919822233344']);
+  assert.equal(parsed.duplicateCount, 1);
+  assert.deepEqual(parsed.invalidInputs, ['9811122233']);
+});
+
+test('calculateSmsSegmentInfo distinguishes GSM-7 and UCS-2 segment limits', () => {
+  const gsm = calculateSmsSegmentInfo('Hello from SimVault!');
+  assert.equal(gsm.encoding, 'GSM-7');
+  assert.equal(gsm.segments, 1);
+
+  const ucs = calculateSmsSegmentInfo('नमस्ते SimVault — 75 chars check '.padEnd(75, 'अ'));
+  assert.equal(ucs.encoding, 'UCS-2');
+  assert.equal(ucs.segments, 2);
+});
+
+test('SSRF guards block IPv4-mapped IPv6 hex normalization, NAT64, benchmark, and IPv4-compatible ranges', () => {
+  assert.equal(isPrivateOrReservedIp('::ffff:7f00:1'), true);
+  assert.equal(isPrivateOrReservedIp('::ffff:a9fe:a9fe'), true);
+  assert.equal(isPrivateOrReservedIp('::127.0.0.1'), true);
+  assert.equal(isPrivateOrReservedIp('64:ff9b::1'), true);
+  assert.equal(isPrivateOrReservedIp('198.18.0.1'), true);
+
+  assert.equal(isValidWebhookUrl('https://[::ffff:127.0.0.1]/hook'), false);
+  assert.equal(isValidWebhookUrl('https://[::ffff:169.254.169.254]/latest'), false);
+  assert.equal(isValidWebhookUrl('https://[::ffff:a9fe:a9fe]/latest'), false);
+  assert.equal(isValidWebhookUrl('https://[::127.0.0.1]/hook'), false);
+  assert.equal(isValidWebhookUrl('https://[64:ff9b::1]/hook'), false);
+  assert.equal(isValidWebhookUrl('https://198.18.0.1/hook'), false);
+});
+
+test('sanitizeSmsText strips NUL and unsafe ASCII control chars while keeping newlines and Unicode', () => {
+  const dirty = 'OTP:\x00 123456\x07\x1b[31m\nRegards,\tSimVault नमस्ते';
+  const clean = sanitizeSmsText(dirty);
+  assert.equal(clean, 'OTP: 123456[31m\nRegards,\tSimVault नमस्ते');
+});
+

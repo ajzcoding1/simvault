@@ -117,6 +117,11 @@ function hashPassword(password) {
   const derived = crypto.scryptSync(password, salt, 64).toString("hex");
   return `${salt}:${derived}`;
 }
+function constantTimeEquals(a, b) {
+  const hashA = crypto.createHash("sha256").update(a).digest();
+  const hashB = crypto.createHash("sha256").update(b).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
 function signWebhookPayload(secret, timestamp, eventId, bodyJson) {
   const signedContent = `${timestamp}.${eventId}.${bodyJson}`;
   return crypto.createHmac("sha256", secret).update(signedContent).digest("hex");
@@ -216,26 +221,84 @@ function redactSensitiveMetadata(input) {
   }
   return input;
 }
-function isPrivateOrReservedIp(ip) {
-  const clean = ip.trim().toLowerCase().replace(/^\[|\]$/g, "");
-  if (!clean) return true;
-  if (clean.startsWith("::ffff:")) {
-    return isPrivateOrReservedIp(clean.slice(7));
+function isPrivateIpv4Octets(a, b, c) {
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;
+  if (a === 198 && (b === 18 || b === 19)) return true;
+  if (a === 198 && b === 51 && c === 100) return true;
+  if (a === 203 && b === 0 && c === 113) return true;
+  if (a >= 224) return true;
+  return false;
+}
+function isPrivateIpv4Words(hi, lo) {
+  return isPrivateIpv4Octets(hi >> 8 & 255, hi & 255, lo >> 8 & 255);
+}
+function parseIpv6Words(raw) {
+  if (!raw.includes(":")) return null;
+  let working = raw;
+  const lastColon = working.lastIndexOf(":");
+  const tail = working.slice(lastColon + 1);
+  if (tail.includes(".")) {
+    const v4 = tail.split(".");
+    if (v4.length !== 4 || !v4.every((p) => /^\d+$/.test(p))) return null;
+    const oct = v4.map(Number);
+    if (oct.some((n) => n < 0 || n > 255)) return null;
+    const wHi = (oct[0] << 8 | oct[1]).toString(16);
+    const wLo = (oct[2] << 8 | oct[3]).toString(16);
+    working = `${working.slice(0, lastColon + 1)}${wHi}:${wLo}`;
   }
-  if (clean === "::1" || clean === "::" || clean.startsWith("fc") || clean.startsWith("fd") || clean.startsWith("fe8") || clean.startsWith("fe9") || clean.startsWith("fea") || clean.startsWith("feb")) {
-    return true;
+  const dblIdx = working.indexOf("::");
+  if (dblIdx !== -1 && working.indexOf("::", dblIdx + 2) !== -1) return null;
+  let groups;
+  if (dblIdx !== -1) {
+    const left = working.slice(0, dblIdx).split(":").filter(Boolean);
+    const right = working.slice(dblIdx + 2).split(":").filter(Boolean);
+    const missing = 8 - (left.length + right.length);
+    if (missing < 1) return null;
+    groups = [...left, ...Array(missing).fill("0"), ...right];
+  } else {
+    groups = working.split(":");
+  }
+  if (groups.length !== 8 || !groups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) return null;
+  return groups.map((g) => parseInt(g, 16));
+}
+function isPrivateOrReservedIp(ip) {
+  const clean = ip.trim().toLowerCase().replace(/^\[|\]$/g, "").split("%")[0];
+  if (!clean) return true;
+  if (clean.includes(":")) {
+    const w = parseIpv6Words(clean);
+    if (!w) return true;
+    const isAllZeroPrefix = (count) => {
+      for (let i = 0; i < count; i++) if (w[i] !== 0) return false;
+      return true;
+    };
+    if (isAllZeroPrefix(7) && (w[7] === 0 || w[7] === 1)) return true;
+    if (isAllZeroPrefix(6)) return isPrivateIpv4Words(w[6], w[7]);
+    if (isAllZeroPrefix(5) && w[5] === 65535) return isPrivateIpv4Words(w[6], w[7]);
+    if (isAllZeroPrefix(4) && w[4] === 65535 && w[5] === 0) return isPrivateIpv4Words(w[6], w[7]);
+    if (w[0] === 256 && w[1] === 0 && w[2] === 0 && w[3] === 0) return true;
+    if (w[0] === 100 && w[1] === 65435) return true;
+    if (w[0] === 8193 && (w[1] === 0 || w[1] === 3512)) return true;
+    if (w[0] === 8194) return isPrivateIpv4Words(w[1], w[2]);
+    if ((w[0] & 65024) === 64512) return true;
+    if ((w[0] & 65472) === 65152) return true;
+    if ((w[0] & 65280) === 65280) return true;
+    return false;
   }
   const ipv4Parts = clean.split(".");
   if (ipv4Parts.length === 4 && ipv4Parts.every((p) => /^\d+$/.test(p))) {
-    const [a, b] = ipv4Parts.map((n) => Number(n));
-    if (a === 0 || a === 10 || a === 127) return true;
-    if (a === 169 && b === 254) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 100 && b >= 64 && b <= 127) return true;
-    if (a >= 224) return true;
+    const octets = ipv4Parts.map((n) => Number(n));
+    if (octets.some((n) => n < 0 || n > 255)) return true;
+    return isPrivateIpv4Octets(octets[0], octets[1], octets[2]);
   }
   return false;
+}
+function sanitizeSmsText(raw) {
+  return String(raw ?? "").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").trim();
 }
 function isValidWebhookUrl(value) {
   try {
@@ -253,9 +316,69 @@ function isValidWebhookUrl(value) {
     return false;
   }
 }
-var E164_REGEX, ALLOWED_TRANSITIONS, SENSITIVE_KEY_PATTERN;
+function calculateSmsSegmentInfo(text) {
+  const value = text ?? "";
+  const length = value.length;
+  const isGsm7 = GSM7_SAFE_REGEX.test(value);
+  const encoding = isGsm7 ? "GSM-7" : "UCS-2";
+  if (length === 0) {
+    return { encoding, length: 0, segments: 0, perSegmentLimit: isGsm7 ? 160 : 70 };
+  }
+  const singleLimit = isGsm7 ? 160 : 70;
+  const multiLimit = isGsm7 ? 153 : 67;
+  const segments = length <= singleLimit ? 1 : Math.ceil(length / multiLimit);
+  return {
+    encoding,
+    length,
+    segments,
+    perSegmentLimit: length <= singleLimit ? singleLimit : multiLimit
+  };
+}
+function parseBulkPhoneList(input) {
+  const rawTokens = [];
+  if (Array.isArray(input)) {
+    for (const item of input) {
+      if (typeof item === "string" && item.trim()) rawTokens.push(item.trim());
+    }
+  } else {
+    const chunks = String(input ?? "").split(/[\r\n,;]+/);
+    for (const chunk of chunks) {
+      const trimmed = chunk.trim();
+      if (!trimmed) continue;
+      const plusCount = (trimmed.match(/\+/g) ?? []).length;
+      if (plusCount >= 2) {
+        for (const sub of trimmed.split(/(?=\+)/)) {
+          if (sub.trim()) rawTokens.push(sub.trim());
+        }
+      } else {
+        rawTokens.push(trimmed);
+      }
+    }
+  }
+  const seen = /* @__PURE__ */ new Set();
+  const validNumbers = [];
+  const invalidInputs = [];
+  let duplicateCount = 0;
+  for (const token of rawTokens) {
+    const normalized = normalizeE164(token);
+    if (!isValidE164(normalized)) {
+      invalidInputs.push(token);
+      continue;
+    }
+    if (seen.has(normalized)) {
+      duplicateCount++;
+      continue;
+    }
+    seen.add(normalized);
+    validNumbers.push(normalized);
+  }
+  return { validNumbers, invalidInputs, duplicateCount };
+}
+var MAX_PERSONAL_SMS_LENGTH, MAX_BULK_RECIPIENTS, E164_REGEX, ALLOWED_TRANSITIONS, SENSITIVE_KEY_PATTERN, GSM7_SAFE_REGEX;
 var init_smsRules = __esm({
   "src/shared/smsRules.ts"() {
+    MAX_PERSONAL_SMS_LENGTH = 640;
+    MAX_BULK_RECIPIENTS = 100;
     E164_REGEX = /^\+[1-9]\d{6,14}$/;
     ALLOWED_TRANSITIONS = {
       created: ["queued", "failed", "expired"],
@@ -269,6 +392,7 @@ var init_smsRules = __esm({
       expired: []
     };
     SENSITIVE_KEY_PATTERN = /(secret|token|password|otp|code|authorization|api_key|apikey|body|phone|msisdn|destination|to)/i;
+    GSM7_SAFE_REGEX = /^[\x20-\x7E\r\n£¥èéùìòÇØøÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ€^{}\\[~\]|]*$/;
   }
 });
 
@@ -1186,7 +1310,10 @@ __export(services_exports, {
   checkIpRateLimit: () => checkIpRateLimit,
   checkLoginRateLimit: () => checkLoginRateLimit,
   clearLoginFailures: () => clearLoginFailures,
+  consumeTotpCode: () => consumeTotpCode,
+  createBulkSmsRequests: () => createBulkSmsRequests,
   createOtpChallenge: () => createOtpChallenge,
+  createPersonalSmsRequest: () => createPersonalSmsRequest,
   createSmsRequest: () => createSmsRequest,
   enqueueWebhookEvent: () => enqueueWebhookEvent,
   getSettingsMap: () => getSettingsMap,
@@ -1230,6 +1357,15 @@ async function updateSetting(db, key, value, actorId, ipAddress = "127.0.0.1") {
     ipAddress
   });
 }
+function pruneMapIfOversized(map) {
+  if (map.size < MAX_RATE_BUCKETS) return;
+  const toDelete = Math.ceil(MAX_RATE_BUCKETS * 0.25);
+  let i = 0;
+  for (const key of map.keys()) {
+    map.delete(key);
+    if (++i >= toDelete) break;
+  }
+}
 function checkIpRateLimit(ip, limitPerMinute) {
   const now = Date.now();
   const windowStart = now - 6e4;
@@ -1238,26 +1374,45 @@ function checkIpRateLimit(ip, limitPerMinute) {
     ipWindow.set(ip, timestamps);
     return false;
   }
+  if (!ipWindow.has(ip)) pruneMapIfOversized(ipWindow);
   timestamps.push(now);
   ipWindow.set(ip, timestamps);
   return true;
 }
-function checkLoginRateLimit(ip, maxFailures = 8, windowMs = 5 * 6e4) {
+function checkLoginRateLimit(key, maxFailures = 8, windowMs = 5 * 6e4) {
   const now = Date.now();
   const cutoff = now - windowMs;
-  const recent = (loginFailureWindow.get(ip) ?? []).filter((t) => t > cutoff);
-  loginFailureWindow.set(ip, recent);
+  const recent = (loginFailureWindow.get(key) ?? []).filter((t) => t > cutoff);
+  if (recent.length === 0) {
+    loginFailureWindow.delete(key);
+  } else {
+    loginFailureWindow.set(key, recent);
+  }
   return recent.length < maxFailures;
 }
-function recordLoginFailure(ip) {
+function recordLoginFailure(key) {
   const now = Date.now();
   const cutoff = now - 5 * 6e4;
-  const recent = (loginFailureWindow.get(ip) ?? []).filter((t) => t > cutoff);
+  const recent = (loginFailureWindow.get(key) ?? []).filter((t) => t > cutoff);
+  if (!loginFailureWindow.has(key)) pruneMapIfOversized(loginFailureWindow);
   recent.push(now);
-  loginFailureWindow.set(ip, recent);
+  loginFailureWindow.set(key, recent);
 }
-function clearLoginFailures(ip) {
-  loginFailureWindow.delete(ip);
+function clearLoginFailures(key) {
+  loginFailureWindow.delete(key);
+}
+function consumeTotpCode(userId, code) {
+  const now = Date.now();
+  for (const [k, exp] of usedTotpWindow.entries()) {
+    if (exp <= now) usedTotpWindow.delete(k);
+  }
+  const cacheKey = `${userId}:${code.trim()}`;
+  if (usedTotpWindow.has(cacheKey)) {
+    return false;
+  }
+  pruneMapIfOversized(usedTotpWindow);
+  usedTotpWindow.set(cacheKey, now + 9e4);
+  return true;
 }
 async function assertPublicWebhookHost(rawUrl) {
   if (!isValidWebhookUrl(rawUrl)) {
@@ -1330,16 +1485,18 @@ function requireScope(ctx, scope) {
     throw new AppError(403, "INSUFFICIENT_SCOPE", `API key lacks required scope: ${scope}`);
   }
 }
-async function checkQuotasAndDestination(db, app, toE164, purpose, ipAddress) {
+async function checkQuotasAndDestination(db, app, toE164, purpose, ipAddress, options) {
   const settings = await getSettingsMap(db);
   if (settings.global_paused === "true") {
     throw new AppError(503, "GATEWAY_PAUSED", "Global SMS kill switch is active. All outbound requests are paused.");
   }
-  const ipLimit = Number(settings.rate_limit_per_ip_minute ?? 30);
-  if (!checkIpRateLimit(ipAddress, ipLimit)) {
-    throw new AppError(429, "RATE_LIMITED", "IP request limit exceeded.");
+  if (!options?.skipIpRateLimit) {
+    const ipLimit = Number(settings.rate_limit_per_ip_minute ?? 30);
+    if (!checkIpRateLimit(ipAddress, ipLimit)) {
+      throw new AppError(429, "RATE_LIMITED", "IP request limit exceeded.");
+    }
   }
-  if (!app.allowedPurposes.includes(purpose)) {
+  if (!options?.bypassPurposeCheck && !app.allowedPurposes.includes(purpose)) {
     throw new AppError(403, "PURPOSE_NOT_ALLOWED", `Purpose '${purpose}' is not enabled for this application.`);
   }
   const destHash = hashDestination(toE164);
@@ -1530,6 +1687,301 @@ async function createSmsRequest(db, input) {
     created_at: createdAt,
     is_test: Boolean(isTest),
     deduplicated: false
+  };
+}
+async function createPersonalSmsRequest(db, input) {
+  const normalizedTo = normalizeE164(input.to);
+  if (!isValidE164(normalizedTo)) {
+    throw new AppError(422, "INVALID_PHONE", "Destination phone must be valid E.164 format (e.g. +919876543210).");
+  }
+  const cleanBody = sanitizeSmsText(input.body);
+  if (!cleanBody || cleanBody.length > MAX_PERSONAL_SMS_LENGTH) {
+    throw new AppError(
+      422,
+      "INVALID_BODY",
+      `Message text must be between 1 and ${MAX_PERSONAL_SMS_LENGTH} characters.`
+    );
+  }
+  const cleanIdempotencyKey = input.idempotencyKey ? sanitizeSmsText(input.idempotencyKey).slice(0, 128) : void 0;
+  const appRow = await db.get(
+    "SELECT id, name, environment, status, allowed_purposes_json, daily_limit, allowlist_only FROM applications WHERE id = ?",
+    input.applicationId
+  );
+  if (!appRow) {
+    throw new AppError(404, "APPLICATION_NOT_FOUND", "Application not found.");
+  }
+  if (appRow.status !== "active") {
+    throw new AppError(403, "APPLICATION_INACTIVE", "Application is paused or disabled.");
+  }
+  if (cleanIdempotencyKey) {
+    const existing = await db.get(
+      "SELECT id, status, created_at, is_test, destination_masked FROM messages WHERE application_id = ? AND idempotency_key = ?",
+      appRow.id,
+      cleanIdempotencyKey
+    );
+    if (existing) {
+      return {
+        message_id: existing.id,
+        status: existing.status,
+        destination_masked: existing.destination_masked,
+        created_at: existing.created_at,
+        is_test: Boolean(existing.is_test),
+        deduplicated: true,
+        segment_info: calculateSmsSegmentInfo(cleanBody)
+      };
+    }
+  }
+  const purpose = String(input.purpose || (input.actorType === "owner" ? "personal_message" : "account_transactional"));
+  await checkQuotasAndDestination(
+    db,
+    {
+      id: appRow.id,
+      dailyLimit: Number(appRow.daily_limit),
+      allowlistOnly: Boolean(appRow.allowlist_only),
+      environment: appRow.environment,
+      allowedPurposes: JSON.parse(appRow.allowed_purposes_json)
+    },
+    normalizedTo,
+    purpose,
+    input.ipAddress ?? "127.0.0.1",
+    { bypassPurposeCheck: input.actorType === "owner" }
+  );
+  const now = /* @__PURE__ */ new Date();
+  const ttl = Math.min(Math.max(Number(input.ttlSeconds ?? 300), 30), 3600);
+  const ttlExpiresAt = new Date(now.getTime() + ttl * 1e3).toISOString();
+  const createdAt = now.toISOString();
+  const messageId = `msg_${crypto3.randomBytes(6).toString("hex")}`;
+  const isTest = appRow.environment === "test" ? 1 : 0;
+  const masked = maskE164(normalizedTo);
+  const segmentInfo = calculateSmsSegmentInfo(cleanBody);
+  await db.run(
+    `INSERT INTO messages (id, application_id, device_id, destination_masked, destination_hash, destination_encrypted, template_id, body_encrypted, purpose, status, is_test, idempotency_key, ttl_expires_at, created_at, queued_at)
+     VALUES (?, ?, NULL, ?, ?, ?, 'personal_custom', ?, ?, 'queued', ?, ?, ?, ?, ?)`,
+    messageId,
+    appRow.id,
+    masked,
+    hashDestination(normalizedTo),
+    encryptField(normalizedTo),
+    encryptField(cleanBody),
+    purpose,
+    isTest,
+    cleanIdempotencyKey ?? null,
+    ttlExpiresAt,
+    createdAt,
+    createdAt
+  );
+  await db.run(
+    `INSERT INTO usage_events (id, application_id, device_id, message_id, event_type, units, occurred_at)
+     VALUES (?, ?, NULL, ?, 'message.requested', ?, ?)`,
+    crypto3.randomUUID(),
+    appRow.id,
+    messageId,
+    Math.max(1, segmentInfo.segments),
+    createdAt
+  );
+  await writeAuditLog(db, {
+    actorType: input.actorType ?? "application",
+    actorId: input.actorId,
+    action: "sms.personal_queued",
+    targetType: "message",
+    targetId: messageId,
+    metadata: {
+      application_id: appRow.id,
+      purpose,
+      destination_masked: masked,
+      segments: segmentInfo.segments,
+      is_test: Boolean(isTest)
+    },
+    ipAddress: input.ipAddress
+  });
+  await enqueueWebhookEvent(db, appRow.id, "message.status", {
+    message_id: messageId,
+    status: "queued",
+    destination_masked: masked,
+    is_test: Boolean(isTest)
+  });
+  return {
+    message_id: messageId,
+    status: "queued",
+    destination_masked: masked,
+    created_at: createdAt,
+    is_test: Boolean(isTest),
+    deduplicated: false,
+    segment_info: segmentInfo
+  };
+}
+async function createBulkSmsRequests(db, input) {
+  const settings = await getSettingsMap(db);
+  if (settings.global_paused === "true") {
+    throw new AppError(503, "GATEWAY_PAUSED", "Global SMS kill switch is active. All outbound requests are paused.");
+  }
+  const ipLimit = Number(settings.rate_limit_per_ip_minute ?? 30);
+  if (!checkIpRateLimit(input.ipAddress ?? "127.0.0.1", ipLimit)) {
+    throw new AppError(429, "RATE_LIMITED", "IP request limit exceeded.");
+  }
+  const appRow = await db.get(
+    "SELECT id, name, environment, status, allowed_purposes_json, daily_limit, allowlist_only FROM applications WHERE id = ?",
+    input.applicationId
+  );
+  if (!appRow) {
+    throw new AppError(404, "APPLICATION_NOT_FOUND", "Application not found.");
+  }
+  if (appRow.status !== "active") {
+    throw new AppError(403, "APPLICATION_INACTIVE", "Application is paused or disabled.");
+  }
+  const allowedPurposes = JSON.parse(appRow.allowed_purposes_json);
+  let resolvedBody = "";
+  let resolvedTemplateId = "bulk_custom";
+  let resolvedPurpose = String(input.purpose || (input.actorType === "owner" ? "bulk_broadcast" : "account_transactional"));
+  if (input.templateCode) {
+    const template = await db.get(
+      "SELECT code, purpose, body FROM message_templates WHERE code = ? AND status = 'approved'",
+      input.templateCode
+    );
+    if (!template) {
+      throw new AppError(422, "TEMPLATE_NOT_APPROVED", `Approved template '${input.templateCode}' not found.`);
+    }
+    const { rendered, missingVariables } = renderTemplate(template.body, input.variables ?? {});
+    if (missingVariables.length > 0) {
+      throw new AppError(422, "MISSING_TEMPLATE_VARIABLES", `Missing template variables: ${missingVariables.join(", ")}`);
+    }
+    resolvedBody = rendered;
+    resolvedTemplateId = template.code;
+    if (!input.purpose) resolvedPurpose = template.purpose;
+  } else {
+    resolvedBody = sanitizeSmsText(input.body ?? "");
+    if (!resolvedBody || resolvedBody.length > MAX_PERSONAL_SMS_LENGTH) {
+      throw new AppError(
+        422,
+        "INVALID_BODY",
+        `Message text must be between 1 and ${MAX_PERSONAL_SMS_LENGTH} characters.`
+      );
+    }
+  }
+  if (input.actorType !== "owner" && !allowedPurposes.includes(resolvedPurpose)) {
+    throw new AppError(403, "PURPOSE_NOT_ALLOWED", `Purpose '${resolvedPurpose}' is not enabled for this application.`);
+  }
+  const parsed = parseBulkPhoneList(input.recipients);
+  if (parsed.validNumbers.length === 0 && parsed.invalidInputs.length === 0) {
+    throw new AppError(400, "EMPTY_RECIPIENTS", "At least one E.164 recipient phone number is required.");
+  }
+  if (parsed.validNumbers.length > MAX_BULK_RECIPIENTS) {
+    throw new AppError(
+      422,
+      "BULK_LIMIT_EXCEEDED",
+      `Maximum ${MAX_BULK_RECIPIENTS} unique recipients allowed per bulk request.`
+    );
+  }
+  const batchId = `batch_${crypto3.randomBytes(5).toString("hex")}`;
+  const segmentInfo = calculateSmsSegmentInfo(resolvedBody);
+  const now = /* @__PURE__ */ new Date();
+  const ttl = Math.min(Math.max(Number(input.ttlSeconds ?? 600), 30), 3600);
+  const ttlExpiresAt = new Date(now.getTime() + ttl * 1e3).toISOString();
+  const isTest = appRow.environment === "test" ? 1 : 0;
+  const results = [];
+  let queuedCount = 0;
+  let failedCount = 0;
+  for (const invalid of parsed.invalidInputs) {
+    results.push({
+      to_masked: maskE164(normalizeE164(invalid)),
+      status: "skipped_invalid",
+      error_code: "INVALID_PHONE",
+      error_message: "Not a valid E.164 phone number."
+    });
+  }
+  for (const toNumber of parsed.validNumbers) {
+    const masked = maskE164(toNumber);
+    try {
+      await checkQuotasAndDestination(
+        db,
+        {
+          id: appRow.id,
+          dailyLimit: Number(appRow.daily_limit),
+          allowlistOnly: Boolean(appRow.allowlist_only),
+          environment: appRow.environment,
+          allowedPurposes
+        },
+        toNumber,
+        resolvedPurpose,
+        input.ipAddress ?? "127.0.0.1",
+        { skipIpRateLimit: true, bypassPurposeCheck: true }
+      );
+      const messageId = `msg_${crypto3.randomBytes(6).toString("hex")}`;
+      const createdAt = (/* @__PURE__ */ new Date()).toISOString();
+      await db.run(
+        `INSERT INTO messages (id, application_id, device_id, destination_masked, destination_hash, destination_encrypted, template_id, body_encrypted, purpose, status, is_test, idempotency_key, ttl_expires_at, created_at, queued_at)
+         VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'queued', ?, NULL, ?, ?, ?)`,
+        messageId,
+        appRow.id,
+        masked,
+        hashDestination(toNumber),
+        encryptField(toNumber),
+        resolvedTemplateId,
+        encryptField(resolvedBody),
+        resolvedPurpose,
+        isTest,
+        ttlExpiresAt,
+        createdAt,
+        createdAt
+      );
+      await db.run(
+        `INSERT INTO usage_events (id, application_id, device_id, message_id, event_type, units, occurred_at)
+         VALUES (?, ?, NULL, ?, 'message.requested', ?, ?)`,
+        crypto3.randomUUID(),
+        appRow.id,
+        messageId,
+        Math.max(1, segmentInfo.segments),
+        createdAt
+      );
+      await enqueueWebhookEvent(db, appRow.id, "message.status", {
+        message_id: messageId,
+        batch_id: batchId,
+        status: "queued",
+        destination_masked: masked,
+        is_test: Boolean(isTest)
+      });
+      queuedCount++;
+      results.push({ to_masked: masked, status: "queued", message_id: messageId });
+    } catch (err) {
+      failedCount++;
+      const appErr = err instanceof AppError ? err : null;
+      results.push({
+        to_masked: masked,
+        status: "failed",
+        error_code: appErr?.code ?? "QUEUE_FAILED",
+        error_message: appErr?.message ?? "Failed to queue recipient."
+      });
+    }
+  }
+  await writeAuditLog(db, {
+    actorType: input.actorType ?? "application",
+    actorId: input.actorId,
+    action: "sms.bulk_queued",
+    targetType: "bulk_batch",
+    targetId: batchId,
+    metadata: {
+      application_id: appRow.id,
+      batch_label: input.batchLabel ? String(input.batchLabel).slice(0, 64) : void 0,
+      template_id: resolvedTemplateId,
+      purpose: resolvedPurpose,
+      queued_count: queuedCount,
+      skipped_invalid_count: parsed.invalidInputs.length,
+      duplicate_count: parsed.duplicateCount,
+      failed_count: failedCount,
+      segments_per_message: segmentInfo.segments
+    },
+    ipAddress: input.ipAddress
+  });
+  return {
+    batch_id: batchId,
+    total_submitted: parsed.validNumbers.length + parsed.invalidInputs.length + parsed.duplicateCount,
+    queued_count: queuedCount,
+    skipped_invalid_count: parsed.invalidInputs.length,
+    duplicate_count: parsed.duplicateCount,
+    failed_count: failedCount,
+    template_id: resolvedTemplateId,
+    segment_info: segmentInfo,
+    results
   };
 }
 async function createOtpChallenge(db, input) {
@@ -1952,6 +2404,9 @@ async function reportJobResult(db, deviceId, jobId, outcome, errorCode) {
   if (!msg || msg.device_id !== deviceId) {
     throw new AppError(404, "JOB_NOT_FOUND", "Job not found for this device.");
   }
+  if (msg.status === outcome || msg.status === "delivered" && outcome === "sent_to_network") {
+    return { status: msg.status };
+  }
   if (!isValidMessageTransition(msg.status, outcome)) {
     throw new AppError(409, "INVALID_TRANSITION", `Cannot transition from ${msg.status} to ${outcome}.`);
   }
@@ -1959,24 +2414,33 @@ async function reportJobResult(db, deviceId, jobId, outcome, errorCode) {
   const nowIso = (/* @__PURE__ */ new Date()).toISOString();
   await db.transaction(async (tx) => {
     if (outcome === "sent_to_network") {
+      const requestedUsage = await tx.get(
+        "SELECT units FROM usage_events WHERE message_id = ? AND event_type = 'message.requested' LIMIT 1",
+        jobId
+      );
+      const sentUnits = Math.max(1, Number(requestedUsage?.units ?? 1));
       await tx.run("UPDATE messages SET status = 'sent_to_network', sent_at = ?, error_code = NULL WHERE id = ?", nowIso, jobId);
       await tx.run("UPDATE otp_challenges SET status = 'sent' WHERE message_id = ? AND status = 'queued'", jobId);
       await tx.run(
         `INSERT INTO usage_events (id, application_id, device_id, message_id, event_type, units, occurred_at)
-         VALUES (?, ?, ?, ?, 'message.sent_to_network', 1, ?)`,
+         VALUES (?, ?, ?, ?, 'message.sent_to_network', ?, ?)`,
         crypto3.randomUUID(),
         msg.application_id,
         deviceId,
         jobId,
+        sentUnits,
         nowIso
       );
       if (!msg.is_test) {
         await tx.run(
           `UPDATE sims
-           SET estimated_sms_sent = estimated_sms_sent + 1,
-               estimated_sms_remaining = CASE WHEN estimated_sms_remaining > 0 THEN estimated_sms_remaining - 1 ELSE 0 END,
+           SET estimated_sms_sent = estimated_sms_sent + ?,
+               estimated_sms_remaining = CASE WHEN estimated_sms_remaining > ? THEN estimated_sms_remaining - ? ELSE 0 END,
                updated_at = ?
            WHERE device_id = ?`,
+          sentUnits,
+          sentUnits,
+          sentUnits,
           nowIso,
           deviceId
         );
@@ -2238,7 +2702,7 @@ async function maybeRunOpportunisticSweep(db, minIntervalMs = 5e3) {
   inFlightSweepByDb.set(db, promise);
   await promise;
 }
-var AppError, ipWindow, loginFailureWindow, lastMaintenanceAtByDb, inFlightMaintenanceByDb, lastSweepAtByDb, inFlightSweepByDb;
+var AppError, MAX_RATE_BUCKETS, ipWindow, loginFailureWindow, usedTotpWindow, lastMaintenanceAtByDb, inFlightMaintenanceByDb, lastSweepAtByDb, inFlightSweepByDb;
 var init_services = __esm({
   "server/services.ts"() {
     init_crypto();
@@ -2251,8 +2715,10 @@ var init_services = __esm({
         this.code = code;
       }
     };
+    MAX_RATE_BUCKETS = 1e4;
     ipWindow = /* @__PURE__ */ new Map();
     loginFailureWindow = /* @__PURE__ */ new Map();
+    usedTotpWindow = /* @__PURE__ */ new Map();
     lastMaintenanceAtByDb = /* @__PURE__ */ new WeakMap();
     inFlightMaintenanceByDb = /* @__PURE__ */ new WeakMap();
     lastSweepAtByDb = /* @__PURE__ */ new WeakMap();
@@ -2261,11 +2727,19 @@ var init_services = __esm({
 });
 
 // server/vercel/sweeper.ts
+init_crypto();
 async function handler(req, res) {
   const cronSecret = process.env.CRON_SECRET?.trim();
+  const isProd = process.env.NODE_ENV === "production" || Boolean(process.env.VERCEL);
+  if (!cronSecret && isProd) {
+    res.statusCode = 503;
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.end(JSON.stringify({ error: { code: "CRON_SECRET_MISSING", message: "Cron endpoint requires CRON_SECRET in production." } }));
+    return;
+  }
   if (cronSecret) {
-    const auth = req.headers.authorization ?? "";
-    if (auth !== `Bearer ${cronSecret}`) {
+    const auth = typeof req.headers.authorization === "string" ? req.headers.authorization : "";
+    if (!constantTimeEquals(auth, `Bearer ${cronSecret}`)) {
       res.statusCode = 401;
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       res.end(JSON.stringify({ error: { code: "UNAUTHORIZED", message: "Invalid cron authorization." } }));
@@ -2284,10 +2758,9 @@ async function handler(req, res) {
     res.end(JSON.stringify({ ok: true, ...result }));
   } catch (err) {
     console.error("[SimVault api/cron/sweeper]", err);
-    const message = err instanceof Error ? err.message : "Sweeper execution failed";
     res.statusCode = 500;
     res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.end(JSON.stringify({ error: { code: "SWEEPER_ERROR", message } }));
+    res.end(JSON.stringify({ error: { code: "SWEEPER_ERROR", message: "Sweeper execution failed." } }));
   }
 }
 export {

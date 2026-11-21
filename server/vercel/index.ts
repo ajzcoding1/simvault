@@ -26,7 +26,6 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     });
   } catch (err) {
     console.error('[SimVault api/index]', err);
-    const message = err instanceof Error ? err.message : 'Server initialization failed';
     if (!res.headersSent) {
       res.statusCode = 500;
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -36,7 +35,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
         JSON.stringify({
           error: {
             code: 'SERVER_INIT_ERROR',
-            message,
+            message: 'Server initialization failed.',
           },
         })
       );

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Router, Request, Response, NextFunction } from 'express';
 import {
+  constantTimeEquals,
   encryptField,
   generateApiKey,
   generateEnrollmentToken,
@@ -19,7 +20,10 @@ import {
   assertPublicWebhookHost,
   checkLoginRateLimit,
   clearLoginFailures,
+  consumeTotpCode,
+  createBulkSmsRequests,
   createOtpChallenge,
+  createPersonalSmsRequest,
   createSmsRequest,
   getSettingsMap,
   maybeRunOpportunisticSweep,
@@ -37,13 +41,17 @@ import {
   VALID_MESSAGE_PURPOSES,
 } from '../../src/shared/smsRules';
 
+function escapeLikePattern(raw: string): string {
+  return raw.replace(/[!%_]/g, '!$&');
+}
+
 function sendAdminError(res: Response, err: unknown): void {
   if (err instanceof AppError) {
     res.status(err.status).json({ error: { code: err.code, message: err.message } });
     return;
   }
-  const message = err instanceof Error ? err.message : 'Unexpected server error';
-  res.status(500).json({ error: { code: 'INTERNAL_ERROR', message } });
+  console.error('[SimVault admin]', err);
+  res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'An unexpected server error occurred.' } });
 }
 
 function isHttpsRequest(req: Request): boolean {
@@ -97,7 +105,7 @@ export function createAdminRouter(db: DbClient): Router {
       }
       if (!isAuthRoute && ['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method)) {
         const providedCsrf = req.headers['x-csrf-token'];
-        if (!sessionCsrf || typeof providedCsrf !== 'string' || providedCsrf !== sessionCsrf) {
+        if (!sessionCsrf || typeof providedCsrf !== 'string' || !constantTimeEquals(providedCsrf, sessionCsrf)) {
           res.status(403).json({ error: { code: 'CSRF_INVALID', message: 'Invalid or missing CSRF token.' } });
           return;
         }
@@ -134,12 +142,20 @@ export function createAdminRouter(db: DbClient): Router {
   router.post('/auth/login', async (req: Request, res: Response) => {
     try {
       const clientIp = req.ip || '127.0.0.1';
-      if (!checkLoginRateLimit(clientIp)) {
+      const { email, password, totp_code } = req.body ?? {};
+      const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+      const accountKey = cleanEmail ? `acct:${cleanEmail}` : '';
+
+      if (!checkLoginRateLimit(clientIp) || (accountKey && !checkLoginRateLimit(accountKey))) {
         throw new AppError(429, 'LOGIN_RATE_LIMITED', 'Too many failed sign-in attempts. Please wait 5 minutes before trying again.');
       }
 
-      const { email, password, totp_code } = req.body ?? {};
-      const cleanEmail = String(email ?? '').trim().toLowerCase();
+      if (typeof email !== 'string' || typeof password !== 'string' || !cleanEmail || !password) {
+        recordLoginFailure(clientIp);
+        if (accountKey) recordLoginFailure(accountKey);
+        throw new AppError(401, 'INVALID_CREDENTIALS', 'Invalid email or password.');
+      }
+
       const user = await db.get<{
         id: string;
         email: string;
@@ -149,8 +165,9 @@ export function createAdminRouter(db: DbClient): Router {
         mfa_secret: string | null;
       }>('SELECT id, email, password_hash, role, mfa_enabled, mfa_secret FROM users WHERE email = ?', cleanEmail);
 
-      if (!user || !verifyPassword(String(password ?? ''), user.password_hash)) {
+      if (!user || !verifyPassword(password, user.password_hash)) {
         recordLoginFailure(clientIp);
+        if (accountKey) recordLoginFailure(accountKey);
         await writeAuditLog(db, {
           actorType: 'system',
           actorId: 'auth_guard',
@@ -164,12 +181,14 @@ export function createAdminRouter(db: DbClient): Router {
       }
 
       if (user.mfa_enabled && user.mfa_secret) {
-        if (!totp_code) {
+        if (totp_code === undefined || totp_code === null || totp_code === '') {
           res.status(200).json({ authenticated: false, mfa_required: true });
           return;
         }
-        if (!verifyTotpCode(user.mfa_secret, String(totp_code))) {
+        const cleanTotp = typeof totp_code === 'string' ? totp_code.trim() : '';
+        if (!cleanTotp || !verifyTotpCode(user.mfa_secret, cleanTotp) || !consumeTotpCode(user.id, cleanTotp)) {
           recordLoginFailure(clientIp);
+          if (accountKey) recordLoginFailure(accountKey);
           await writeAuditLog(db, {
             actorType: 'owner',
             actorId: user.id,
@@ -179,16 +198,18 @@ export function createAdminRouter(db: DbClient): Router {
             metadata: { reason: 'invalid_totp' },
             ipAddress: clientIp,
           });
-          throw new AppError(401, 'INVALID_MFA', 'Invalid authenticator code.');
+          throw new AppError(401, 'INVALID_MFA', 'Invalid or already-used authenticator code.');
         }
       }
 
       clearLoginFailures(clientIp);
+      if (accountKey) clearLoginFailures(accountKey);
       const rawToken = crypto.randomBytes(32).toString('base64url');
       const csrfToken = crypto.randomBytes(24).toString('base64url');
       const nowIso = new Date().toISOString();
       const expiresAt = new Date(Date.now() + 24 * 3600_000).toISOString();
 
+      await db.run('DELETE FROM sessions WHERE expires_at <= ?', nowIso);
       await db.run(
         `INSERT INTO sessions (id, user_id, token_hash, csrf_token, mfa_verified, expires_at, created_at)
          VALUES (?, ?, ?, ?, 1, ?, ?)`,
@@ -311,9 +332,10 @@ export function createAdminRouter(db: DbClient): Router {
     try {
       const owner = getOwner(req);
       const { code } = req.body ?? {};
+      const cleanCode = typeof code === 'string' ? code.trim() : '';
       const user = await db.get<{ mfa_secret: string | null }>('SELECT mfa_secret FROM users WHERE id = ?', owner.id);
-      if (!user?.mfa_secret || !verifyTotpCode(user.mfa_secret, String(code ?? ''))) {
-        throw new AppError(422, 'INVALID_TOTP', 'Verification code did not match.');
+      if (!user?.mfa_secret || !cleanCode || !verifyTotpCode(user.mfa_secret, cleanCode) || !consumeTotpCode(owner.id, cleanCode)) {
+        throw new AppError(422, 'INVALID_TOTP', 'Verification code did not match or was already used.');
       }
       await db.run('UPDATE users SET mfa_enabled = 1, updated_at = ? WHERE id = ?', new Date().toISOString(), owner.id);
       await writeAuditLog(db, {
@@ -333,6 +355,34 @@ export function createAdminRouter(db: DbClient): Router {
   router.post('/security/mfa/disable', async (req: Request, res: Response) => {
     try {
       const owner = getOwner(req);
+      const { current_password, totp_code } = req.body ?? {};
+      const user = await db.get<{ password_hash: string; mfa_enabled: number; mfa_secret: string | null }>(
+        'SELECT password_hash, mfa_enabled, mfa_secret FROM users WHERE id = ?',
+        owner.id
+      );
+      if (!user) throw new AppError(404, 'NOT_FOUND', 'Owner account not found.');
+
+      if (user.mfa_enabled) {
+        const validPassword =
+          typeof current_password === 'string' &&
+          current_password.length > 0 &&
+          verifyPassword(current_password, user.password_hash);
+        const cleanTotp = typeof totp_code === 'string' ? totp_code.trim() : '';
+        const validTotp =
+          Boolean(user.mfa_secret) &&
+          cleanTotp.length > 0 &&
+          verifyTotpCode(user.mfa_secret!, cleanTotp) &&
+          consumeTotpCode(owner.id, cleanTotp);
+
+        if (!validPassword && !validTotp) {
+          throw new AppError(
+            401,
+            'AUTH_RECONFIRM_REQUIRED',
+            'Enter your current password or a valid 6-digit authenticator code to disable MFA.'
+          );
+        }
+      }
+
       await db.run('UPDATE users SET mfa_enabled = 0, updated_at = ? WHERE id = ?', new Date().toISOString(), owner.id);
       await writeAuditLog(db, {
         actorType: 'owner',
@@ -738,8 +788,9 @@ export function createAdminRouter(db: DbClient): Router {
         params.push(appId);
       }
       if (q) {
-        sql += ' AND (LOWER(m.id) LIKE LOWER(?) OR LOWER(m.destination_masked) LIKE LOWER(?) OR LOWER(m.template_id) LIKE LOWER(?))';
-        params.push(`%${q}%`, `%${q}%`, `%${q}%`);
+        const likeTerm = `%${escapeLikePattern(q)}%`;
+        sql += " AND (LOWER(m.id) LIKE LOWER(?) ESCAPE '!' OR LOWER(m.destination_masked) LIKE LOWER(?) ESCAPE '!' OR LOWER(m.template_id) LIKE LOWER(?) ESCAPE '!')";
+        params.push(likeTerm, likeTerm, likeTerm);
       }
       sql += ' ORDER BY m.created_at DESC LIMIT 100';
 
@@ -754,17 +805,17 @@ export function createAdminRouter(db: DbClient): Router {
     try {
       const owner = getOwner(req);
       const { application_id, to, template_id, variables, purpose, ttl_seconds, idempotency_key } = req.body ?? {};
-      if (!application_id || !to || !template_id) {
-        throw new AppError(400, 'BAD_REQUEST', 'application_id, to, and template_id are required.');
+      if (typeof application_id !== 'string' || typeof to !== 'string' || typeof template_id !== 'string' || !application_id || !to || !template_id) {
+        throw new AppError(400, 'BAD_REQUEST', 'application_id, to, and template_id must be non-empty strings.');
       }
       const result = await createSmsRequest(db, {
-        applicationId: String(application_id),
-        to: String(to),
-        templateCode: String(template_id),
-        variables: variables && typeof variables === 'object' ? variables : {},
-        purpose: String(purpose || 'account_transactional'),
+        applicationId: application_id,
+        to,
+        templateCode: template_id,
+        variables: variables && typeof variables === 'object' && !Array.isArray(variables) ? variables : {},
+        purpose: typeof purpose === 'string' && purpose ? purpose : 'account_transactional',
         ttlSeconds: ttl_seconds ? Number(ttl_seconds) : 180,
-        idempotencyKey: idempotency_key ? String(idempotency_key).trim() : undefined,
+        idempotencyKey: typeof idempotency_key === 'string' && idempotency_key.trim() ? idempotency_key.trim() : undefined,
         actorId: owner.id,
         ipAddress: req.ip,
       });
@@ -776,6 +827,65 @@ export function createAdminRouter(db: DbClient): Router {
 
   router.post('/messages/send', handleAdminSendSms);
   router.post('/messages/test-send', handleAdminSendSms);
+
+  router.post('/messages/personal', async (req: Request, res: Response) => {
+    try {
+      const owner = getOwner(req);
+      const { application_id, to, body, purpose, ttl_seconds, idempotency_key } = req.body ?? {};
+      if (typeof application_id !== 'string' || typeof to !== 'string' || typeof body !== 'string' || !application_id || !to || !body) {
+        throw new AppError(400, 'BAD_REQUEST', 'application_id, to, and body must be non-empty strings.');
+      }
+      const result = await createPersonalSmsRequest(db, {
+        applicationId: application_id,
+        to,
+        body,
+        purpose: typeof purpose === 'string' && purpose ? purpose : 'personal_message',
+        ttlSeconds: ttl_seconds ? Number(ttl_seconds) : 300,
+        idempotencyKey: typeof idempotency_key === 'string' && idempotency_key.trim() ? idempotency_key.trim() : undefined,
+        actorType: 'owner',
+        actorId: owner.id,
+        ipAddress: req.ip,
+      });
+      res.status(result.deduplicated ? 200 : 202).json(result);
+    } catch (err) {
+      sendAdminError(res, err);
+    }
+  });
+
+  router.post('/messages/bulk', async (req: Request, res: Response) => {
+    try {
+      const owner = getOwner(req);
+      const { application_id, recipients, body, template_id, variables, purpose, ttl_seconds, batch_label } = req.body ?? {};
+      if (
+        typeof application_id !== 'string' ||
+        !application_id ||
+        (!Array.isArray(recipients) && typeof recipients !== 'string') ||
+        (typeof body !== 'string' && typeof template_id !== 'string')
+      ) {
+        throw new AppError(
+          400,
+          'BAD_REQUEST',
+          'application_id, recipients, and either body or template_id are required.'
+        );
+      }
+      const result = await createBulkSmsRequests(db, {
+        applicationId: application_id,
+        recipients: Array.isArray(recipients) ? recipients.filter((r): r is string => typeof r === 'string') : recipients,
+        body: typeof body === 'string' ? body : undefined,
+        templateCode: typeof template_id === 'string' ? template_id : undefined,
+        variables: variables && typeof variables === 'object' && !Array.isArray(variables) ? variables : {},
+        purpose: typeof purpose === 'string' ? purpose : undefined,
+        ttlSeconds: ttl_seconds ? Number(ttl_seconds) : 600,
+        batchLabel: typeof batch_label === 'string' ? batch_label : undefined,
+        actorType: 'owner',
+        actorId: owner.id,
+        ipAddress: req.ip,
+      });
+      res.status(202).json(result);
+    } catch (err) {
+      sendAdminError(res, err);
+    }
+  });
 
   // --- OTP Challenges ---
   router.get('/otp-challenges', async (_req: Request, res: Response) => {
@@ -1342,8 +1452,9 @@ export function createAdminRouter(db: DbClient): Router {
       let sql = 'SELECT * FROM audit_logs WHERE 1=1';
       const params: string[] = [];
       if (q) {
-        sql += ' AND (LOWER(action) LIKE LOWER(?) OR LOWER(target_type) LIKE LOWER(?) OR LOWER(target_id) LIKE LOWER(?) OR LOWER(metadata_redacted_json) LIKE LOWER(?))';
-        params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+        const likeTerm = `%${escapeLikePattern(q)}%`;
+        sql += " AND (LOWER(action) LIKE LOWER(?) ESCAPE '!' OR LOWER(target_type) LIKE LOWER(?) ESCAPE '!' OR LOWER(target_id) LIKE LOWER(?) ESCAPE '!' OR LOWER(metadata_redacted_json) LIKE LOWER(?) ESCAPE '!')";
+        params.push(likeTerm, likeTerm, likeTerm, likeTerm);
       }
       sql += ' ORDER BY created_at DESC LIMIT 120';
       res.json({ logs: await db.all(sql, ...params) });

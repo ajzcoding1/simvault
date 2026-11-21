@@ -13,6 +13,7 @@ import {
   Moon,
   PauseOctagon,
   ScrollText,
+  Send,
   Settings,
   ShieldCheck,
   Smartphone,
@@ -41,6 +42,7 @@ import { ApiDocsView } from './components/ApiDocsView';
 import { AuditLogsView, SecurityView } from './components/SecurityAndAuditView';
 import { SettingsAndInfraView } from './components/SettingsAndInfraView';
 import { SendTestSmsModal } from './components/SendTestSmsModal';
+import { ComposeSmsView } from './components/ComposeSmsView';
 import { PublicPortal } from './components/PublicPortal';
 
 const NAV_GROUPS: Array<{
@@ -51,6 +53,7 @@ const NAV_GROUPS: Array<{
     heading: 'Operations',
     items: [
       { id: 'overview', label: 'Overview', icon: LayoutDashboard },
+      { id: 'compose', label: 'Compose & Bulk', icon: Send },
       { id: 'messages', label: 'Messages', icon: MessageSquare },
       { id: 'otp-challenges', label: 'OTP Challenges', icon: ShieldCheck },
     ],
@@ -84,6 +87,7 @@ const NAV_GROUPS: Array<{
 
 const SECTION_TITLES: Record<NavSection, string> = {
   overview: 'Overview',
+  compose: 'Personal & Bulk SMS',
   applications: 'Applications',
   'api-keys': 'API Keys',
   'api-docs': 'API Documentation',
@@ -477,6 +481,14 @@ export default function App() {
               onOpenSendModal={() => setSendModalOpen(true)}
             />
           )}
+          {section === 'compose' && (
+            <ComposeSmsView
+              applications={applications}
+              overview={overview}
+              onNavigate={navigateTo}
+              onSent={triggerRefresh}
+            />
+          )}
           {section === 'applications' && <ApplicationsView applications={applications} onRefresh={triggerRefresh} />}
           {section === 'api-keys' && <ApiKeysView applications={applications} onRefresh={triggerRefresh} />}
           {section === 'api-docs' && <ApiDocsView applications={applications} />}
@@ -514,6 +526,7 @@ export default function App() {
         onClose={() => setSendModalOpen(false)}
         applications={applications}
         onSent={triggerRefresh}
+        onOpenBulkCompose={() => navigateTo('compose')}
       />
     </div>
   );

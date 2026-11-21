@@ -1,4 +1,5 @@
 import express, { Request, Response, NextFunction } from 'express';
+import { constantTimeEquals } from './crypto';
 import { DbClient, getDb } from './db';
 import { createV1Router } from './routes/v1';
 import { createAdminRouter } from './routes/admin';
@@ -17,11 +18,24 @@ export async function createSimVaultApp(existingDb?: DbClient): Promise<SimVault
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
 
-  // Security headers (Doc 07)
+  // Security headers (Doc 07 + CSP compatible with AI Studio iframe preview)
   app.use((req: Request, res: Response, next: NextFunction) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-DNS-Prefetch-Control', 'off');
+    res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
     res.setHeader('Referrer-Policy', 'no-referrer');
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    if (isProd) {
+      res.setHeader(
+        'Content-Security-Policy',
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
+      );
+    }
+    const xfProto = req.headers['x-forwarded-proto'];
+    if (req.secure || (typeof xfProto === 'string' && xfProto.split(',')[0].trim() === 'https')) {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
     if (req.path.startsWith('/api') || req.path.startsWith('/v1')) {
       res.setHeader('Cache-Control', 'no-store');
     }
@@ -30,7 +44,7 @@ export async function createSimVaultApp(existingDb?: DbClient): Promise<SimVault
 
   app.use(express.json({ limit: '64kb' }));
 
-  // Public health endpoint (no secrets)
+  // Public health endpoint (no secrets or raw DB error details)
   app.get('/health', async (_req: Request, res: Response) => {
     try {
       const queueRow = await db.get<{ count: number | string }>(
@@ -50,20 +64,24 @@ export async function createSimVaultApp(existingDb?: DbClient): Promise<SimVault
         gateway_devices_online: Number(onlineDevices?.count ?? 0),
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Database health check failed';
+      console.error('[SimVault /health]', err);
       res.status(503).json({
         status: 'error',
-        error: { code: 'DB_UNAVAILABLE', message },
+        error: { code: 'DB_UNAVAILABLE', message: 'Database health check failed.' },
       });
     }
   });
 
-  // Vercel Cron / external scheduled sweeper endpoint
+  // Vercel Cron / external scheduled sweeper endpoint (fail-closed in production when CRON_SECRET missing)
   app.get('/api/cron/sweeper', async (req: Request, res: Response) => {
     const cronSecret = process.env.CRON_SECRET?.trim();
+    if (!cronSecret && (isProd || Boolean(process.env.VERCEL))) {
+      res.status(503).json({ error: { code: 'CRON_SECRET_MISSING', message: 'Cron endpoint requires CRON_SECRET in production.' } });
+      return;
+    }
     if (cronSecret) {
-      const auth = req.headers.authorization ?? '';
-      if (auth !== `Bearer ${cronSecret}`) {
+      const auth = typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
+      if (!constantTimeEquals(auth, `Bearer ${cronSecret}`)) {
         res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Invalid cron authorization.' } });
         return;
       }
@@ -72,8 +90,8 @@ export async function createSimVaultApp(existingDb?: DbClient): Promise<SimVault
       const result = await runSweeperTick(db);
       res.json({ ok: true, ...result });
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Sweeper tick failed';
-      res.status(500).json({ error: { code: 'SWEEPER_ERROR', message } });
+      console.error('[SimVault /api/cron/sweeper]', err);
+      res.status(500).json({ error: { code: 'SWEEPER_ERROR', message: 'Sweeper tick failed.' } });
     }
   });
 
