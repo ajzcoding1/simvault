@@ -4,6 +4,7 @@ import type { ThemeMode } from '../utils/theme';
 import {
   type CodeLanguage,
   PUBLIC_ENDPOINTS,
+  PUBLIC_PLACEHOLDER_BASE_URL,
   WEBHOOK_VERIFY_SNIPPET,
   buildQuickstartSnippet,
 } from '../utils/publicApiDocs';
@@ -58,16 +59,9 @@ export function PublicPortal({
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const emailInputRef: RefObject<HTMLInputElement | null> = useRef<HTMLInputElement | null>(null);
 
-  const baseUrl = useMemo(() => {
-    if (typeof window !== 'undefined' && window.location?.origin) {
-      return window.location.origin;
-    }
-    return 'https://your-simvault-domain.com';
-  }, []);
-
   const quickstartCode = useMemo(
-    () => buildQuickstartSnippet(selectedLang, baseUrl),
-    [selectedLang, baseUrl]
+    () => buildQuickstartSnippet(selectedLang, PUBLIC_PLACEHOLDER_BASE_URL),
+    [selectedLang]
   );
 
   const activeEndpoint = useMemo(
@@ -198,8 +192,8 @@ export function PublicPortal({
                 <div className="pt-4 border-t border-slate-200 dark:border-slate-800 grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
                   <div>
                     <div className="text-slate-500 dark:text-slate-400">API Base URL</div>
-                    <div className="font-mono font-medium text-slate-900 dark:text-slate-100 mt-1 truncate" title={baseUrl}>
-                      {baseUrl}/v1
+                    <div className="font-mono font-medium text-slate-900 dark:text-slate-100 mt-1">
+                      Private · Sign in to view
                     </div>
                   </div>
                   <div>
@@ -396,10 +390,12 @@ export function PublicPortal({
                   <li className="border-b border-slate-200 dark:border-slate-800 pb-4">
                     <div className="text-xs font-mono font-semibold text-blue-700 dark:text-blue-400">Step 02</div>
                     <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-50 mt-1">
-                      Configure Environment Variable Server-Side
+                      Configure Base URL &amp; Key Server-Side
                     </h3>
                     <p className="text-xs text-slate-600 dark:text-slate-300 mt-1 leading-relaxed">
-                      Store <code className="font-mono">SIMVAULT_API_KEY</code> exclusively on your backend server. Never embed API keys inside browser bundles or mobile apps.
+                      Copy your private Base URL from <strong>API Docs</strong> after Owner Sign In and store both{' '}
+                      <code className="font-mono">SIMVAULT_BASE_URL</code> and <code className="font-mono">SIMVAULT_API_KEY</code>{' '}
+                      exclusively on your backend server.
                     </p>
                   </li>
                   <li>

@@ -164,7 +164,12 @@ export const PUBLIC_ENDPOINTS: PublicEndpointSpec[] = [
   },
 ];
 
-export function buildQuickstartSnippet(language: CodeLanguage, baseUrl: string): string {
+export const PUBLIC_PLACEHOLDER_BASE_URL = 'https://<YOUR_SIMVAULT_HOST>';
+
+export function buildQuickstartSnippet(
+  language: CodeLanguage,
+  baseUrl: string = PUBLIC_PLACEHOLDER_BASE_URL
+): string {
   const normalizedBase = baseUrl.replace(/\/+$/, '');
   if (language === 'curl') {
     return `# 1. Create an OTP challenge (server-side only)
