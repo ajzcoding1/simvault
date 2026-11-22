@@ -1,0 +1,29 @@
+[Unit]
+Description=SimVault Personal SIM SMS & OTP Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+Group=__SERVICE_USER__
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=__APP_DIR__/.env
+ExecStart=__APP_DIR__/node_modules/.bin/tsx server.ts
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+
+# Systemd security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=__APP_DIR__/data
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=simvault
+
+[Install]
+WantedBy=multi-user.target

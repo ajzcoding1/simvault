@@ -1,0 +1,24 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "regions": ["bom1"],
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/**/*.mjs": {
+      "includeFiles": "android-gateway/**"
+    }
+  },
+  "rewrites": [
+    { "source": "/health", "destination": "/api/index" },
+    { "source": "/v1/(.*)", "destination": "/api/index" },
+    { "source": "/api/cron/sweeper", "destination": "/api/cron/sweeper" },
+    { "source": "/api/(.*)", "destination": "/api/index" },
+    { "source": "/((?!api/|v1/|health$|assets/|.*\\..*).*)", "destination": "/index.html" }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/sweeper",
+      "schedule": "0 0 * * *"
+    }
+  ]
+}

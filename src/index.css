@@ -1,0 +1,198 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-display: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Public Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+  }
+  h1, h2, h3, h4, .font-display {
+    font-family: var(--font-display);
+  }
+  code, pre, .font-mono {
+    font-family: var(--font-mono);
+  }
+
+  .dark input:not([type="checkbox"]):not([type="radio"]),
+  .dark select,
+  .dark textarea {
+    background-color: #020617;
+    color: #f1f5f9;
+    border-color: #334155;
+  }
+
+  .dark input::placeholder,
+  .dark textarea::placeholder {
+    color: #64748b;
+  }
+
+  .dark input:focus,
+  .dark select:focus,
+  .dark textarea:focus {
+    outline: none;
+    border-color: #3b82f6;
+  }
+}
+
+@layer utilities {
+  /* Dark-mode surface mapping across console cards, tables, and drawers */
+  :where(.dark) .bg-white:not([class*="dark:bg-"]) {
+    background-color: #0f172a;
+  }
+  :where(.dark) .bg-slate-50:not([class*="dark:bg-"]) {
+    background-color: #020617;
+  }
+  :where(.dark) .bg-slate-50\/70:not([class*="dark:bg-"]) {
+    background-color: rgba(15, 23, 42, 0.7);
+  }
+  :where(.dark) .bg-slate-100:not([class*="dark:bg-"]) {
+    background-color: #1e293b;
+  }
+
+  /* Table headers and nested code previews inside cards */
+  :where(.dark) thead tr.bg-slate-50,
+  :where(.dark) .bg-white .bg-slate-50:not([class*="dark:bg-"]) {
+    background-color: #111c33;
+  }
+
+  :where(.dark) .hover\:bg-slate-50:hover:not([class*="dark:hover:bg-"]) {
+    background-color: #1e293b;
+  }
+  :where(.dark) .hover\:bg-slate-50\/70:hover:not([class*="dark:hover:bg-"]) {
+    background-color: rgba(30, 41, 59, 0.65);
+  }
+  :where(.dark) .hover\:bg-slate-100:hover:not([class*="dark:hover:bg-"]) {
+    background-color: #1e293b;
+  }
+  :where(.dark) .hover\:bg-slate-200\/70:hover:not([class*="dark:hover:bg-"]) {
+    background-color: rgba(51, 65, 85, 0.7);
+  }
+
+  /* Primary dark buttons and active pills on dark cards */
+  :where(.dark) button.bg-slate-900:not([class*="dark:bg-"]),
+  :where(.dark) a.bg-slate-900:not([class*="dark:bg-"]) {
+    background-color: #1d4ed8;
+    border: 1px solid #2563eb;
+  }
+  :where(.dark) button.bg-slate-900:not([class*="dark:bg-"]):hover,
+  :where(.dark) a.bg-slate-900:not([class*="dark:bg-"]):hover {
+    background-color: #2563eb;
+  }
+
+  /* Code blocks stay deep dark with crisp hairline borders */
+  :where(.dark) pre.bg-slate-900,
+  :where(.dark) div.bg-slate-900.border-slate-800 {
+    background-color: #020617;
+    border-color: #1e293b;
+  }
+
+  /* Borders & dividers */
+  :where(.dark) .border-slate-100:not([class*="dark:border-"]) {
+    border-color: #1e293b;
+  }
+  :where(.dark) .border-slate-200:not([class*="dark:border-"]) {
+    border-color: #1e293b;
+  }
+  :where(.dark) .border-slate-300:not([class*="dark:border-"]) {
+    border-color: #334155;
+  }
+  :where(.dark) .border-slate-50:not([class*="dark:border-"]) {
+    border-color: #1e293b;
+  }
+  :where(.dark) .divide-slate-100 > :not(:last-child) {
+    border-color: #1e293b;
+  }
+
+  /* Typography */
+  :where(.dark) .text-slate-950:not([class*="dark:text-"]),
+  :where(.dark) .text-slate-900:not([class*="dark:text-"]) {
+    color: #f8fafc;
+  }
+  :where(.dark) .text-slate-800:not([class*="dark:text-"]) {
+    color: #e2e8f0;
+  }
+  :where(.dark) .text-slate-700:not([class*="dark:text-"]) {
+    color: #cbd5e1;
+  }
+  :where(.dark) .text-slate-600:not([class*="dark:text-"]) {
+    color: #94a3b8;
+  }
+  :where(.dark) .text-slate-500:not([class*="dark:text-"]) {
+    color: #94a3b8;
+  }
+  :where(.dark) .text-slate-400:not([class*="dark:text-"]) {
+    color: #64748b;
+  }
+  :where(.dark) .text-slate-300:not([class*="dark:text-"]) {
+    color: #475569;
+  }
+  :where(.dark) .bg-slate-900 .text-slate-300,
+  :where(.dark) .bg-slate-950 .text-slate-300 {
+    color: #cbd5e1;
+  }
+  :where(.dark) .hover\:text-slate-900:hover:not([class*="dark:hover:text-"]),
+  :where(.dark) .hover\:text-slate-800:hover:not([class*="dark:hover:text-"]) {
+    color: #f8fafc;
+  }
+
+  /* Links & semantic status/alert banners */
+  :where(.dark) .text-blue-700:not([class*="dark:text-"]) {
+    color: #60a5fa;
+  }
+
+  :where(.dark) .bg-rose-50 {
+    background-color: rgba(136, 19, 55, 0.28);
+  }
+  :where(.dark) .hover\:bg-rose-50:hover {
+    background-color: rgba(136, 19, 55, 0.38);
+  }
+  :where(.dark) .border-rose-200,
+  :where(.dark) .border-rose-300 {
+    border-color: rgba(244, 63, 94, 0.35);
+  }
+  :where(.dark) .text-rose-700,
+  :where(.dark) .text-rose-800,
+  :where(.dark) .text-rose-900,
+  :where(.dark) .text-rose-950 {
+    color: #fda4af;
+  }
+
+  :where(.dark) .bg-emerald-50 {
+    background-color: rgba(6, 78, 59, 0.32);
+  }
+  :where(.dark) .border-emerald-200 {
+    border-color: rgba(16, 185, 129, 0.35);
+  }
+  :where(.dark) .text-emerald-700,
+  :where(.dark) .text-emerald-800,
+  :where(.dark) .text-emerald-900 {
+    color: #6ee7b7;
+  }
+
+  :where(.dark) .bg-amber-50 {
+    background-color: rgba(120, 53, 15, 0.32);
+  }
+  :where(.dark) .bg-amber-100,
+  :where(.dark) .hover\:bg-amber-100:hover {
+    background-color: rgba(146, 64, 14, 0.45);
+  }
+  :where(.dark) .border-amber-200,
+  :where(.dark) .border-amber-300 {
+    border-color: rgba(245, 158, 11, 0.35);
+  }
+  :where(.dark) .text-amber-700,
+  :where(.dark) .text-amber-800,
+  :where(.dark) .text-amber-900,
+  :where(.dark) .text-amber-950 {
+    color: #fcd34d;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
