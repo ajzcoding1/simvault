@@ -141,3 +141,7 @@ curl -X POST https://your-vercel-app.vercel.app/v1/otp/verify \
   -H "Content-Type: application/json" \
   -d '{ "challenge_id": "otp_CHALLENGE_ID", "code": "123456" }'
 ```
+
+## License
+
+SimVault is licensed under the [MIT License](./LICENSE).
