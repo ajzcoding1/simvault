@@ -1,6 +1,6 @@
 {
-  "name": "SimVault — Personal SIM SMS & OTP Platform",
-  "description": "Self-hosted application-level SMS & OTP orchestration platform routing through enrolled Android SIM gateways with strict security, idempotency, and audit controls.",
+  "name": "SimVault — Self-hosted SMS & OTP Gateway",
+  "description": "Owner-operated SMS and OTP delivery platform that routes application requests through a paired Android phone and physical SIM.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
