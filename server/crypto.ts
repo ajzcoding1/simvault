@@ -16,6 +16,22 @@ function resolveKeysPath(): string {
 
 let warnedMissingEnvKeys = false;
 
+export function assertRequiredRuntimeKeys(env: Record<string, string | undefined> = process.env): void {
+  if (env.NODE_ENV === 'test' || env.SIMVAULT_DB_PATH === ':memory:' ) {
+    return;
+  }
+  if (!env.VERCEL && !env.AWS_LAMBDA_FUNCTION_NAME) return;
+
+  const missing = (
+    ['API_KEY_PEPPER', 'JWT_PRIVATE_KEY', 'OTP_PEPPER', 'FIELD_ENCRYPTION_KEY'] as const
+  ).filter((name) => !env[name]?.trim());
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required serverless cryptographic environment variables: ${missing.join(', ')}`
+    );
+  }
+}
+
 function loadOrCreateRuntimeKeys(): Record<KeyName, string> {
   if (runtimeKeysCache) return runtimeKeysCache;
 
@@ -69,6 +85,9 @@ function getEnvKey(name: KeyName, _fallbackSeed: string): Buffer {
   const raw = process.env[name];
   if (raw && raw.length >= 16) {
     return crypto.createHash('sha256').update(raw).digest();
+  }
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    throw new Error(`Missing required serverless cryptographic environment variable: ${name}`);
   }
   const keys = loadOrCreateRuntimeKeys();
   return crypto.createHash('sha256').update(keys[name]).digest();
@@ -234,13 +253,17 @@ export function computeTotpCode(secret: string, timeMs = Date.now()): string {
 }
 
 export function verifyTotpCode(secret: string, submittedCode: string, timeMs = Date.now()): boolean {
+  return findTotpWindow(secret, submittedCode, timeMs) !== null;
+}
+
+export function findTotpWindow(secret: string, submittedCode: string, timeMs = Date.now()): number | null {
   const clean = submittedCode.trim();
-  if (!/^\d{6}$/.test(clean)) return false;
+  if (!/^\d{6}$/.test(clean)) return null;
   for (const delta of [-30000, 0, 30000]) {
     const expected = computeTotpCode(secret, timeMs + delta);
     if (crypto.timingSafeEqual(Buffer.from(clean), Buffer.from(expected))) {
-      return true;
+      return Math.floor((timeMs + delta) / 1000 / 30);
     }
   }
-  return false;
+  return null;
 }

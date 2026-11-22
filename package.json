@@ -1,9 +1,5 @@
 {
-<<<<<<< HEAD
   "name": "simvault",
-=======
-  "name": "react-example",
->>>>>>> 359d427a6db7954a6e13a960bc672ab4f7639089
   "private": true,
   "version": "0.0.0",
   "type": "module",

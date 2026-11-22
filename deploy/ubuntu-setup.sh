@@ -58,6 +58,12 @@ if [[ ! -f "$APP_DIR/.env" ]]; then
     VPS_IP="$(hostname -I | awk '{print $1}')"
     BASE_URL="http://${VPS_IP:-localhost}"
   fi
+  if [[ -z "${SSL_EMAIL:-}" ]]; then
+    echo "Error: provide an owner email as the second argument." >&2
+    echo "Usage: sudo bash deploy/ubuntu-setup.sh sms.yourdomain.com owner@example.com" >&2
+    exit 1
+  fi
+  ADMIN_PASSWORD="$(openssl rand -hex 24)"
 
   cat > "$APP_DIR/.env" <<EOF
 NODE_ENV=production
@@ -71,13 +77,24 @@ JWT_PRIVATE_KEY=$(openssl rand -hex 32)
 API_KEY_PEPPER=$(openssl rand -hex 32)
 OTP_PEPPER=$(openssl rand -hex 32)
 FIELD_ENCRYPTION_KEY=$(openssl rand -hex 32)
-SIMVAULT_ADMIN_EMAIL=${SSL_EMAIL:-owner@simvault.local}
-SIMVAULT_ADMIN_PASSWORD=SimVault!2026
+SIMVAULT_ADMIN_EMAIL=${SSL_EMAIL}
+SIMVAULT_ADMIN_PASSWORD=${ADMIN_PASSWORD}
 LOG_LEVEL=info
 EOF
-  echo "Created $APP_DIR/.env (default login: ${SSL_EMAIL:-owner@simvault.local} / SimVault!2026 — change password after first login!)."
+  echo "Created $APP_DIR/.env."
+  echo "Owner email: ${SSL_EMAIL}"
+  echo "Generated owner password: ${ADMIN_PASSWORD}"
+  echo "Save this password now; it is stored in $APP_DIR/.env with mode 600."
 else
   echo "Existing $APP_DIR/.env preserved."
+fi
+
+if grep -q '^SIMVAULT_ADMIN_PASSWORD=SimVault!2026$' "$APP_DIR/.env"; then
+  ROTATED_ADMIN_PASSWORD="$(openssl rand -hex 24)"
+  sed -i "s|^SIMVAULT_ADMIN_PASSWORD=.*$|SIMVAULT_ADMIN_PASSWORD=${ROTATED_ADMIN_PASSWORD}|" "$APP_DIR/.env"
+  echo "Rotated a previously used default owner password."
+  echo "Generated owner password: ${ROTATED_ADMIN_PASSWORD}"
+  echo "Save this password now; it is stored in $APP_DIR/.env with mode 600."
 fi
 chmod 600 "$APP_DIR/.env"
 

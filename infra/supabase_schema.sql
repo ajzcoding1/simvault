@@ -217,6 +217,14 @@ CREATE TABLE IF NOT EXISTS platform_settings (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS used_totp_codes (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  code_hash TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, code_hash)
+);
+
 -- Indexes for queue polling, idempotency, OTP expiry, and usage reporting
 CREATE INDEX IF NOT EXISTS idx_messages_status_created ON messages(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_app_created ON messages(application_id, created_at DESC);

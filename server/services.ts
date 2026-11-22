@@ -1,8 +1,10 @@
 import crypto from 'node:crypto';
 import dns from 'node:dns';
+import { request as httpsRequest } from 'node:https';
 import {
   decryptField,
   encryptField,
+  findTotpWindow,
   generateOtpCode,
   hashDestination,
   hashOtpCode,
@@ -76,7 +78,6 @@ export async function updateSetting(
 const MAX_RATE_BUCKETS = 10_000;
 const ipWindow = new Map<string, number[]>();
 const loginFailureWindow = new Map<string, number[]>();
-const usedTotpWindow = new Map<string, number>();
 
 function pruneMapIfOversized<V>(map: Map<string, V>): void {
   if (map.size < MAX_RATE_BUCKETS) return;
@@ -127,18 +128,32 @@ export function clearLoginFailures(key: string): void {
   loginFailureWindow.delete(key);
 }
 
-export function consumeTotpCode(userId: string, code: string): boolean {
-  const now = Date.now();
-  for (const [k, exp] of usedTotpWindow.entries()) {
-    if (exp <= now) usedTotpWindow.delete(k);
-  }
-  const cacheKey = `${userId}:${code.trim()}`;
-  if (usedTotpWindow.has(cacheKey)) {
-    return false;
-  }
-  pruneMapIfOversized(usedTotpWindow);
-  usedTotpWindow.set(cacheKey, now + 90_000);
-  return true;
+export async function consumeTotpCode(
+  db: DbClient,
+  userId: string,
+  secret: string,
+  code: string,
+  timeMs = Date.now()
+): Promise<boolean> {
+  if (findTotpWindow(secret, code, timeMs) === null) return false;
+
+  const nowIso = new Date(timeMs).toISOString();
+  const expiresAt = new Date(timeMs + 90_000).toISOString();
+  const codeHash = crypto.createHash('sha256').update(`${userId}:${code.trim()}`).digest('hex');
+
+  return db.transaction(async (tx) => {
+    await tx.run('DELETE FROM used_totp_codes WHERE expires_at <= ?', nowIso);
+    const inserted = await tx.run(
+      `INSERT INTO used_totp_codes (user_id, code_hash, expires_at, created_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id, code_hash) DO NOTHING`,
+      userId,
+      codeHash,
+      expiresAt,
+      nowIso
+    );
+    return inserted.changes === 1;
+  });
 }
 
 export async function assertPublicWebhookHost(rawUrl: string): Promise<URL> {
@@ -169,6 +184,68 @@ export async function assertPublicWebhookHost(rawUrl: string): Promise<URL> {
     throw new AppError(422, 'DNS_LOOKUP_FAILED', 'Webhook hostname could not be resolved via DNS.');
   }
   return parsed;
+}
+
+interface PinnedWebhookResponse {
+  ok: boolean;
+  status: number;
+  text(): Promise<string>;
+}
+
+export async function fetchPinnedWebhook(
+  rawUrl: string,
+  options: {
+    method: 'POST';
+    headers: Record<string, string>;
+    body: string;
+    timeoutMs?: number;
+  }
+): Promise<PinnedWebhookResponse> {
+  const parsed = await assertPublicWebhookHost(rawUrl);
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
+  const records = await dns.promises.lookup(hostname, { all: true, verbatim: true });
+  const address = records.find((record) => !isPrivateOrReservedIp(record.address))?.address;
+  if (!address) {
+    throw new AppError(422, 'SSRF_BLOCKED', 'Webhook host could not be pinned to a public IP address.');
+  }
+
+  const timeoutMs = options.timeoutMs ?? 4000;
+  const port = parsed.port ? Number(parsed.port) : 443;
+
+  return new Promise<PinnedWebhookResponse>((resolve, reject) => {
+    const req = httpsRequest(
+      {
+        protocol: 'https:',
+        hostname: address,
+        port,
+        servername: hostname,
+        method: options.method,
+        path: `${parsed.pathname}${parsed.search}`,
+        headers: {
+          ...options.headers,
+          Host: parsed.host,
+          'Content-Length': Buffer.byteLength(options.body),
+        },
+        rejectUnauthorized: true,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+        res.on('end', () => {
+          const status = res.statusCode ?? 0;
+          const text = Buffer.concat(chunks).toString('utf8');
+          resolve({
+            ok: status >= 200 && status < 300,
+            status,
+            text: async () => text,
+          });
+        });
+      }
+    );
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('Webhook request timed out')));
+    req.on('error', reject);
+    req.end(options.body);
+  });
 }
 
 export interface AuthenticatedAppContext {
@@ -1898,9 +1975,7 @@ export async function runSweeperTick(db: DbExecutor): Promise<{
       hook.id
     );
 
-    const deliveryTask = assertPublicWebhookHost(hook.url)
-      .then(() =>
-        fetch(hook.url, {
+    const deliveryTask = fetchPinnedWebhook(hook.url, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -1909,10 +1984,8 @@ export async function runSweeperTick(db: DbExecutor): Promise<{
             'X-SimVault-Signature': `v1=${sig}`,
           },
           body: hook.payload_redacted_json,
-          redirect: 'error',
-          signal: AbortSignal.timeout(4000),
+          timeoutMs: 4000,
         })
-      )
       .then(async (res) => {
         if (res.ok) {
           await db.run(

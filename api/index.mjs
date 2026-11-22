@@ -24,6 +24,18 @@ function resolveKeysPath() {
   const expanded = raw.startsWith("~/") ? path.join(os.homedir(), raw.slice(2)) : raw;
   return path.resolve(process.cwd(), expanded);
 }
+function assertRequiredRuntimeKeys(env = process.env) {
+  if (env.NODE_ENV === "test" || env.SIMVAULT_DB_PATH === ":memory:") {
+    return;
+  }
+  if (!env.VERCEL && !env.AWS_LAMBDA_FUNCTION_NAME) return;
+  const missing = ["API_KEY_PEPPER", "JWT_PRIVATE_KEY", "OTP_PEPPER", "FIELD_ENCRYPTION_KEY"].filter((name) => !env[name]?.trim());
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required serverless cryptographic environment variables: ${missing.join(", ")}`
+    );
+  }
+}
 function loadOrCreateRuntimeKeys() {
   if (runtimeKeysCache) return runtimeKeysCache;
   const isInMemory = process.env.NODE_ENV === "test" || process.env.SIMVAULT_DB_PATH === ":memory:";
@@ -64,6 +76,9 @@ function getEnvKey(name, _fallbackSeed) {
   const raw = process.env[name];
   if (raw && raw.length >= 16) {
     return crypto.createHash("sha256").update(raw).digest();
+  }
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    throw new Error(`Missing required serverless cryptographic environment variable: ${name}`);
   }
   const keys = loadOrCreateRuntimeKeys();
   return crypto.createHash("sha256").update(keys[name]).digest();
@@ -202,16 +217,16 @@ function computeTotpCode(secret, timeMs = Date.now()) {
   const codeInt = (hmac[offset] & 127) << 24 | (hmac[offset + 1] & 255) << 16 | (hmac[offset + 2] & 255) << 8 | hmac[offset + 3] & 255;
   return String(codeInt % 1e6).padStart(6, "0");
 }
-function verifyTotpCode(secret, submittedCode, timeMs = Date.now()) {
+function findTotpWindow(secret, submittedCode, timeMs = Date.now()) {
   const clean = submittedCode.trim();
-  if (!/^\d{6}$/.test(clean)) return false;
+  if (!/^\d{6}$/.test(clean)) return null;
   for (const delta of [-3e4, 0, 3e4]) {
     const expected = computeTotpCode(secret, timeMs + delta);
     if (crypto.timingSafeEqual(Buffer.from(clean), Buffer.from(expected))) {
-      return true;
+      return Math.floor((timeMs + delta) / 1e3 / 30);
     }
   }
-  return false;
+  return null;
 }
 var runtimeKeysCache, warnedMissingEnvKeys, BASE32_ALPHABET;
 var init_crypto = __esm({
@@ -633,6 +648,19 @@ function resolveDbPath(dbPath) {
   return path2.resolve(process.cwd(), cleaned);
 }
 async function getDb(dbPath) {
+  const testMode = process.env.NODE_ENV === "test" || process.env.SIMVAULT_DB_PATH === ":memory:" || dbPath === ":memory:";
+  if (!testMode) {
+    const adminEmail = process.env.SIMVAULT_ADMIN_EMAIL?.trim() ?? "";
+    const adminPassword = process.env.SIMVAULT_ADMIN_PASSWORD?.trim() ?? "";
+    if (!adminEmail || !adminPassword) {
+      throw new Error(
+        "SIMVAULT_ADMIN_EMAIL and SIMVAULT_ADMIN_PASSWORD are required. Configure both before starting SimVault."
+      );
+    }
+    if (adminPassword.length < 16) {
+      throw new Error("SIMVAULT_ADMIN_PASSWORD must contain at least 16 characters.");
+    }
+  }
   if (dbCache.client) return dbCache.client;
   if (dbCache.initPromise) return dbCache.initPromise;
   dbCache.initPromise = (async () => {
@@ -649,16 +677,14 @@ async function getDb(dbPath) {
     if (pgUrl) {
       const connectPostgresClient = async (targetUrl) => {
         let connectionString = targetUrl;
-        let useSsl = { rejectUnauthorized: false };
+        let useSsl = { rejectUnauthorized: true };
         try {
           const parsed = new URL(targetUrl);
           if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") {
             useSsl = false;
           } else {
             const sslMode = parsed.searchParams.get("sslmode");
-            if (sslMode === "verify-full") {
-              useSsl = { rejectUnauthorized: true };
-            } else if (sslMode) {
+            if (sslMode) {
               parsed.searchParams.delete("sslmode");
               connectionString = parsed.toString();
             }
@@ -854,14 +880,22 @@ async function writeAuditLog(db, entry) {
     (/* @__PURE__ */ new Date()).toISOString()
   );
 }
-async function seedInitialData(db) {
+async function seedInitialData(db, overrides) {
   const existingUsers = await db.get("SELECT COUNT(*) as cnt FROM users");
   if (Number(existingUsers?.cnt ?? 0) > 0) return;
   const now = /* @__PURE__ */ new Date();
   const isoNow = now.toISOString();
   const ownerId = "usr_owner_primary";
-  const initialEmail = (process.env.SIMVAULT_ADMIN_EMAIL || "owner@simvault.local").trim().toLowerCase();
-  const initialPassword = process.env.SIMVAULT_ADMIN_PASSWORD || "SimVault!2026";
+  const initialEmail = (overrides?.email ?? process.env.SIMVAULT_ADMIN_EMAIL ?? "").trim().toLowerCase();
+  const initialPassword = (overrides?.password ?? process.env.SIMVAULT_ADMIN_PASSWORD ?? "").trim();
+  if (!initialEmail || !initialPassword) {
+    throw new Error(
+      "SIMVAULT_ADMIN_EMAIL and SIMVAULT_ADMIN_PASSWORD are required before the owner account can be created."
+    );
+  }
+  if (!overrides && initialPassword.length < 16) {
+    throw new Error("SIMVAULT_ADMIN_PASSWORD must contain at least 16 characters.");
+  }
   await db.run(
     `INSERT INTO users (id, email, password_hash, role, mfa_enabled, mfa_secret, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1355,6 +1389,15 @@ var init_db = __esm({
     created_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS used_totp_codes (
+    user_id TEXT NOT NULL,
+    code_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, code_hash),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
   CREATE TABLE IF NOT EXISTS platform_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -1380,6 +1423,7 @@ var init_db = __esm({
 // server/services.ts
 import crypto3 from "node:crypto";
 import dns from "node:dns";
+import { request as httpsRequest } from "node:https";
 async function getSettingsMap(db) {
   const rows = await db.all("SELECT key, value FROM platform_settings");
   const map = {};
@@ -1449,18 +1493,24 @@ function recordLoginFailure(key) {
 function clearLoginFailures(key) {
   loginFailureWindow.delete(key);
 }
-function consumeTotpCode(userId, code) {
-  const now = Date.now();
-  for (const [k, exp] of usedTotpWindow.entries()) {
-    if (exp <= now) usedTotpWindow.delete(k);
-  }
-  const cacheKey = `${userId}:${code.trim()}`;
-  if (usedTotpWindow.has(cacheKey)) {
-    return false;
-  }
-  pruneMapIfOversized(usedTotpWindow);
-  usedTotpWindow.set(cacheKey, now + 9e4);
-  return true;
+async function consumeTotpCode(db, userId, secret, code, timeMs = Date.now()) {
+  if (findTotpWindow(secret, code, timeMs) === null) return false;
+  const nowIso = new Date(timeMs).toISOString();
+  const expiresAt = new Date(timeMs + 9e4).toISOString();
+  const codeHash = crypto3.createHash("sha256").update(`${userId}:${code.trim()}`).digest("hex");
+  return db.transaction(async (tx) => {
+    await tx.run("DELETE FROM used_totp_codes WHERE expires_at <= ?", nowIso);
+    const inserted = await tx.run(
+      `INSERT INTO used_totp_codes (user_id, code_hash, expires_at, created_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id, code_hash) DO NOTHING`,
+      userId,
+      codeHash,
+      expiresAt,
+      nowIso
+    );
+    return inserted.changes === 1;
+  });
 }
 async function assertPublicWebhookHost(rawUrl) {
   if (!isValidWebhookUrl(rawUrl)) {
@@ -1490,6 +1540,51 @@ async function assertPublicWebhookHost(rawUrl) {
     throw new AppError(422, "DNS_LOOKUP_FAILED", "Webhook hostname could not be resolved via DNS.");
   }
   return parsed;
+}
+async function fetchPinnedWebhook(rawUrl, options) {
+  const parsed = await assertPublicWebhookHost(rawUrl);
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, "");
+  const records = await dns.promises.lookup(hostname, { all: true, verbatim: true });
+  const address = records.find((record) => !isPrivateOrReservedIp(record.address))?.address;
+  if (!address) {
+    throw new AppError(422, "SSRF_BLOCKED", "Webhook host could not be pinned to a public IP address.");
+  }
+  const timeoutMs = options.timeoutMs ?? 4e3;
+  const port = parsed.port ? Number(parsed.port) : 443;
+  return new Promise((resolve, reject) => {
+    const req = httpsRequest(
+      {
+        protocol: "https:",
+        hostname: address,
+        port,
+        servername: hostname,
+        method: options.method,
+        path: `${parsed.pathname}${parsed.search}`,
+        headers: {
+          ...options.headers,
+          Host: parsed.host,
+          "Content-Length": Buffer.byteLength(options.body)
+        },
+        rejectUnauthorized: true
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+        res.on("end", () => {
+          const status = res.statusCode ?? 0;
+          const text = Buffer.concat(chunks).toString("utf8");
+          resolve({
+            ok: status >= 200 && status < 300,
+            status,
+            text: async () => text
+          });
+        });
+      }
+    );
+    req.setTimeout(timeoutMs, () => req.destroy(new Error("Webhook request timed out")));
+    req.on("error", reject);
+    req.end(options.body);
+  });
 }
 async function authenticateApiKey(db, rawBearerToken, hashFn) {
   const secretHash = hashFn(rawBearerToken);
@@ -2738,20 +2833,17 @@ async function runSweeperTick(db) {
       new Date(Date.now() + 1e4).toISOString(),
       hook.id
     );
-    const deliveryTask = assertPublicWebhookHost(hook.url).then(
-      () => fetch(hook.url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-SimVault-Event-Id": hook.event_id,
-          "X-SimVault-Timestamp": ts,
-          "X-SimVault-Signature": `v1=${sig}`
-        },
-        body: hook.payload_redacted_json,
-        redirect: "error",
-        signal: AbortSignal.timeout(4e3)
-      })
-    ).then(async (res) => {
+    const deliveryTask = fetchPinnedWebhook(hook.url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-SimVault-Event-Id": hook.event_id,
+        "X-SimVault-Timestamp": ts,
+        "X-SimVault-Signature": `v1=${sig}`
+      },
+      body: hook.payload_redacted_json,
+      timeoutMs: 4e3
+    }).then(async (res) => {
       if (res.ok) {
         await db.run(
           "UPDATE webhook_deliveries SET status = 'delivered', attempt_count = ?, last_http_status = ? WHERE id = ?",
@@ -2822,7 +2914,7 @@ async function maybeRunOpportunisticSweep(db, minIntervalMs = 5e3) {
   inFlightSweepByDb.set(db, promise);
   await promise;
 }
-var AppError, MAX_RATE_BUCKETS, ipWindow, loginFailureWindow, usedTotpWindow, lastMaintenanceAtByDb, inFlightMaintenanceByDb, lastSweepAtByDb, inFlightSweepByDb;
+var AppError, MAX_RATE_BUCKETS, ipWindow, loginFailureWindow, lastMaintenanceAtByDb, inFlightMaintenanceByDb, lastSweepAtByDb, inFlightSweepByDb;
 var init_services = __esm({
   "server/services.ts"() {
     init_crypto();
@@ -2838,7 +2930,6 @@ var init_services = __esm({
     MAX_RATE_BUCKETS = 1e4;
     ipWindow = /* @__PURE__ */ new Map();
     loginFailureWindow = /* @__PURE__ */ new Map();
-    usedTotpWindow = /* @__PURE__ */ new Map();
     lastMaintenanceAtByDb = /* @__PURE__ */ new WeakMap();
     inFlightMaintenanceByDb = /* @__PURE__ */ new WeakMap();
     lastSweepAtByDb = /* @__PURE__ */ new WeakMap();
@@ -3413,7 +3504,7 @@ function createAdminRouter(db) {
           return;
         }
         const cleanTotp = typeof totp_code === "string" ? totp_code.trim() : "";
-        if (!cleanTotp || !verifyTotpCode(user.mfa_secret, cleanTotp) || !consumeTotpCode(user.id, cleanTotp)) {
+        if (!cleanTotp || !await consumeTotpCode(db, user.id, user.mfa_secret, cleanTotp)) {
           recordLoginFailure(clientIp);
           if (accountKey) recordLoginFailure(accountKey);
           await writeAuditLog(db, {
@@ -3549,7 +3640,7 @@ function createAdminRouter(db) {
       const { code } = req.body ?? {};
       const cleanCode = typeof code === "string" ? code.trim() : "";
       const user = await db.get("SELECT mfa_secret FROM users WHERE id = ?", owner.id);
-      if (!user?.mfa_secret || !cleanCode || !verifyTotpCode(user.mfa_secret, cleanCode) || !consumeTotpCode(owner.id, cleanCode)) {
+      if (!user?.mfa_secret || !cleanCode || !await consumeTotpCode(db, owner.id, user.mfa_secret, cleanCode)) {
         throw new AppError(422, "INVALID_TOTP", "Verification code did not match or was already used.");
       }
       await db.run("UPDATE users SET mfa_enabled = 1, updated_at = ? WHERE id = ?", (/* @__PURE__ */ new Date()).toISOString(), owner.id);
@@ -3578,7 +3669,7 @@ function createAdminRouter(db) {
       if (user.mfa_enabled) {
         const validPassword = typeof current_password === "string" && current_password.length > 0 && verifyPassword(current_password, user.password_hash);
         const cleanTotp = typeof totp_code === "string" ? totp_code.trim() : "";
-        const validTotp = Boolean(user.mfa_secret) && cleanTotp.length > 0 && verifyTotpCode(user.mfa_secret, cleanTotp) && consumeTotpCode(owner.id, cleanTotp);
+        const validTotp = Boolean(user.mfa_secret) && cleanTotp.length > 0 && await consumeTotpCode(db, owner.id, user.mfa_secret, cleanTotp);
         if (!validPassword && !validTotp) {
           throw new AppError(
             401,
@@ -4747,6 +4838,7 @@ __export(app_exports, {
 });
 import express from "express";
 async function createSimVaultApp(existingDb) {
+  assertRequiredRuntimeKeys();
   const db = existingDb ?? await getDb();
   const app = express();
   const isProd = process.env.NODE_ENV === "production";

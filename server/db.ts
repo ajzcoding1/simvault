@@ -466,6 +466,15 @@ const SCHEMA_SQL = `
     created_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS used_totp_codes (
+    user_id TEXT NOT NULL,
+    code_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, code_hash),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
   CREATE TABLE IF NOT EXISTS platform_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -560,6 +569,19 @@ if (!globalForDb.__simvaultDbCache) {
 const dbCache = globalForDb.__simvaultDbCache;
 
 export async function getDb(dbPath?: string): Promise<DbClient> {
+  const testMode = process.env.NODE_ENV === 'test' || process.env.SIMVAULT_DB_PATH === ':memory:' || dbPath === ':memory:';
+  if (!testMode) {
+    const adminEmail = process.env.SIMVAULT_ADMIN_EMAIL?.trim() ?? '';
+    const adminPassword = process.env.SIMVAULT_ADMIN_PASSWORD?.trim() ?? '';
+    if (!adminEmail || !adminPassword) {
+      throw new Error(
+        'SIMVAULT_ADMIN_EMAIL and SIMVAULT_ADMIN_PASSWORD are required. Configure both before starting SimVault.'
+      );
+    }
+    if (adminPassword.length < 16) {
+      throw new Error('SIMVAULT_ADMIN_PASSWORD must contain at least 16 characters.');
+    }
+  }
   if (dbCache.client) return dbCache.client;
   if (dbCache.initPromise) return dbCache.initPromise;
 
@@ -583,16 +605,14 @@ export async function getDb(dbPath?: string): Promise<DbClient> {
     if (pgUrl) {
       const connectPostgresClient = async (targetUrl: string): Promise<PostgresDbClient> => {
         let connectionString = targetUrl;
-        let useSsl: boolean | { rejectUnauthorized: boolean } = { rejectUnauthorized: false };
+        let useSsl: boolean | { rejectUnauthorized: boolean } = { rejectUnauthorized: true };
         try {
           const parsed = new URL(targetUrl);
           if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') {
             useSsl = false;
           } else {
             const sslMode = parsed.searchParams.get('sslmode');
-            if (sslMode === 'verify-full') {
-              useSsl = { rejectUnauthorized: true };
-            } else if (sslMode) {
+            if (sslMode) {
               parsed.searchParams.delete('sslmode');
               connectionString = parsed.toString();
             }
@@ -761,7 +781,10 @@ export async function createIsolatedTestDb(): Promise<DbClient> {
   rawDb.exec('PRAGMA foreign_keys = ON;');
   const client = new SqliteDbClient(rawDb);
   await migrateSchema(client);
-  await seedInitialData(client);
+  await seedInitialData(client, {
+    email: 'owner@simvault.local',
+    password: 'SimVault!2026',
+  });
   return client;
 }
 
@@ -842,7 +865,10 @@ export async function writeAuditLog(
   );
 }
 
-async function seedInitialData(db: DbExecutor): Promise<void> {
+async function seedInitialData(
+  db: DbExecutor,
+  overrides?: { email: string; password: string }
+): Promise<void> {
   const existingUsers = await db.get<{ cnt: number | string }>('SELECT COUNT(*) as cnt FROM users');
   if (Number(existingUsers?.cnt ?? 0) > 0) return;
 
@@ -850,8 +876,20 @@ async function seedInitialData(db: DbExecutor): Promise<void> {
   const isoNow = now.toISOString();
 
   const ownerId = 'usr_owner_primary';
-  const initialEmail = (process.env.SIMVAULT_ADMIN_EMAIL || 'owner@simvault.local').trim().toLowerCase();
-  const initialPassword = process.env.SIMVAULT_ADMIN_PASSWORD || 'SimVault!2026';
+  const initialEmail = (
+    overrides?.email ??
+    process.env.SIMVAULT_ADMIN_EMAIL ??
+    ''
+  ).trim().toLowerCase();
+  const initialPassword = (overrides?.password ?? process.env.SIMVAULT_ADMIN_PASSWORD ?? '').trim();
+  if (!initialEmail || !initialPassword) {
+    throw new Error(
+      'SIMVAULT_ADMIN_EMAIL and SIMVAULT_ADMIN_PASSWORD are required before the owner account can be created.'
+    );
+  }
+  if (!overrides && initialPassword.length < 16) {
+    throw new Error('SIMVAULT_ADMIN_PASSWORD must contain at least 16 characters.');
+  }
   await db.run(
     `INSERT INTO users (id, email, password_hash, role, mfa_enabled, mfa_secret, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,

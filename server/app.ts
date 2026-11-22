@@ -1,5 +1,5 @@
 import express, { Request, Response, NextFunction } from 'express';
-import { constantTimeEquals } from './crypto';
+import { assertRequiredRuntimeKeys, constantTimeEquals } from './crypto';
 import { DbClient, getDb } from './db';
 import { createV1Router } from './routes/v1';
 import { createAdminRouter } from './routes/admin';
@@ -11,6 +11,7 @@ export interface SimVaultAppContext {
 }
 
 export async function createSimVaultApp(existingDb?: DbClient): Promise<SimVaultAppContext> {
+  assertRequiredRuntimeKeys();
   const db = existingDb ?? (await getDb());
   const app = express();
   const isProd = process.env.NODE_ENV === 'production';
@@ -18,11 +19,7 @@ export async function createSimVaultApp(existingDb?: DbClient): Promise<SimVault
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
 
-<<<<<<< HEAD
   // Security headers and Content-Security-Policy
-=======
-  // Security headers (Doc 07 + CSP compatible with AI Studio iframe preview)
->>>>>>> 359d427a6db7954a6e13a960bc672ab4f7639089
   app.use((req: Request, res: Response, next: NextFunction) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-DNS-Prefetch-Control', 'off');

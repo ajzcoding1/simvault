@@ -12,7 +12,6 @@ import {
   hashPassword,
   hashToken,
   verifyPassword,
-  verifyTotpCode,
 } from '../crypto';
 import { DbClient, writeAuditLog } from '../db';
 import {
@@ -186,7 +185,7 @@ export function createAdminRouter(db: DbClient): Router {
           return;
         }
         const cleanTotp = typeof totp_code === 'string' ? totp_code.trim() : '';
-        if (!cleanTotp || !verifyTotpCode(user.mfa_secret, cleanTotp) || !consumeTotpCode(user.id, cleanTotp)) {
+        if (!cleanTotp || !(await consumeTotpCode(db, user.id, user.mfa_secret, cleanTotp))) {
           recordLoginFailure(clientIp);
           if (accountKey) recordLoginFailure(accountKey);
           await writeAuditLog(db, {
@@ -334,7 +333,7 @@ export function createAdminRouter(db: DbClient): Router {
       const { code } = req.body ?? {};
       const cleanCode = typeof code === 'string' ? code.trim() : '';
       const user = await db.get<{ mfa_secret: string | null }>('SELECT mfa_secret FROM users WHERE id = ?', owner.id);
-      if (!user?.mfa_secret || !cleanCode || !verifyTotpCode(user.mfa_secret, cleanCode) || !consumeTotpCode(owner.id, cleanCode)) {
+      if (!user?.mfa_secret || !cleanCode || !(await consumeTotpCode(db, owner.id, user.mfa_secret, cleanCode))) {
         throw new AppError(422, 'INVALID_TOTP', 'Verification code did not match or was already used.');
       }
       await db.run('UPDATE users SET mfa_enabled = 1, updated_at = ? WHERE id = ?', new Date().toISOString(), owner.id);
@@ -371,8 +370,7 @@ export function createAdminRouter(db: DbClient): Router {
         const validTotp =
           Boolean(user.mfa_secret) &&
           cleanTotp.length > 0 &&
-          verifyTotpCode(user.mfa_secret!, cleanTotp) &&
-          consumeTotpCode(owner.id, cleanTotp);
+          await consumeTotpCode(db, owner.id, user.mfa_secret!, cleanTotp);
 
         if (!validPassword && !validTotp) {
           throw new AppError(
